@@ -9,8 +9,8 @@ class SoT:
     def __init__(self):
         # Load the model from HF
         self.__MODEL_PATH = "saytes/SoT_DistilBERT"
-        self.model = DistilBertForSequenceClassification.from_pretrained(self.__MODEL_PATH, token="[REDACTED_HF_TOKEN]")
-        self.tokenizer = DistilBertTokenizer.from_pretrained(self.__MODEL_PATH, token="[REDACTED_HF_TOKEN]")
+        self.model = DistilBertForSequenceClassification.from_pretrained(self.__MODEL_PATH)
+        self.tokenizer = DistilBertTokenizer.from_pretrained(self.__MODEL_PATH)
         
         # Load the label mapping
         self.__LABEL_MAPPING_PATH = os.path.join(str(default_path()), "config/label_mapping.json")
