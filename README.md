@@ -296,3 +296,16 @@ If you find our work helpful, please cite:
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+
+## Local planning chat
+
+The package includes a small local web chat for everyday planning. It shows the SoT paradigm selected for every turn and lets you choose among installed Claude Code, Codex, codex-fugu, and OpenCode launchers. The UI stores a logical transcript locally and reuses a harness native session when possible; changing harnesses creates a bounded textual handoff. Sessions can be named or deleted, response and literal thinking blocks have separate tabs, and the last route is shown as a compact status pill.
+
+    pip install -e .
+    sot-chat
+    # open http://127.0.0.1:8787
+
+To add reference material, create or open a session, choose multiple UTF-8 text files in **Context files**, then check **Include uploaded texts in next prompt** before sending. The checkbox clears after that invocation; the files remain available until you press **Clear**. Uploads are stored with the local conversation, bounded to 50 files, 1 MB per file, 6 MB total, and 120,000 injected characters by default. PDF and Office files are not parsed; convert them to text first.
+
+The server binds to localhost and planning calls are configured read-only by default. Set SOT_WORKDIR to the project directory the harness should see, SOT_CHAT_DATA_DIR to change transcript storage, and SOT_HANDOFF_MAX_CHARS to change the cross-harness handoff budget. Leave the model field blank to delegate model selection to the selected harness configuration. Codex and codex-fugu model lists are read from their installed catalogs, including newly released models and each model's supported reasoning levels. Set SOT_DEVICE=cpu to force CPU routing; it defaults to CUDA when available. Set SOT_CLAUDE_MODELS to a comma-separated list to add full Claude model IDs to the selector.

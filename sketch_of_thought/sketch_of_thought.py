@@ -13,6 +13,16 @@ class SoT:
         self.__MODEL_PATH = "saytes/SoT_DistilBERT"
         self.model = DistilBertForSequenceClassification.from_pretrained(self.__MODEL_PATH)
         self.tokenizer = DistilBertTokenizer.from_pretrained(self.__MODEL_PATH)
+
+        requested_device = os.environ.get("SOT_DEVICE", "auto").lower()
+        if requested_device == "auto":
+            requested_device = "cuda" if torch.cuda.is_available() else "cpu"
+        if requested_device.startswith("cuda") and not torch.cuda.is_available():
+            logger.warning("SOT_DEVICE requests CUDA, but CUDA is unavailable; falling back to CPU.")
+            requested_device = "cpu"
+        self.device = torch.device(requested_device)
+        self.model.to(self.device)
+        self.model.eval()
         
         # Load the label mapping
         self.__LABEL_MAPPING_PATH = os.path.join(str(default_path()), "config/label_mapping.json")
@@ -148,14 +158,22 @@ class SoT:
             return copy.deepcopy(self.CONTEXT_CACHE[language_code][paradigm])
     
     def classify_question(self, question):
-        """
-        Uses the pretrained DistilBERT model to classify the paradigm of a question.
-        """
+        """Uses the pretrained DistilBERT model to classify a question."""
+
+        return self.classify_question_details(question)["paradigm"]
+
+    def classify_question_details(self, question):
+        """Return the selected paradigm and classifier confidence."""
 
         inputs = self.tokenizer(question, return_tensors="pt", truncation=True, padding=True)
-        outputs = self.model(**inputs)
-        predicted_class = torch.argmax(outputs.logits, dim=1).item()
-        
-        # Reverse mapping to get the paradigm name
+        inputs = {key: value.to(self.device) for key, value in inputs.items()}
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+            probabilities = torch.softmax(outputs.logits, dim=1)
+        predicted_class = torch.argmax(probabilities, dim=1).item()
+
         label_mapping_reverse = {v: k for k, v in self.__LABEL_MAPPING.items()}
-        return label_mapping_reverse[predicted_class]
+        return {
+            "paradigm": label_mapping_reverse[predicted_class],
+            "confidence": probabilities[0, predicted_class].item(),
+        }

@@ -40,6 +40,9 @@ development = [
     "ipywidgets>=8.1.0"
 ]
 
+[project.scripts]
+sot-chat = "sketch_of_thought.server:main"
+
 [project.urls]
 "Homepage" = "https://github.com/SimonAytes/SoT"
 "Documentation" = "https://github.com/SimonAytes/SoT#README.md"
