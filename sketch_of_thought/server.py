@@ -6,6 +6,7 @@ import json
 import os
 import threading
 import uuid
+from contextlib import contextmanager
 from email.parser import BytesParser
 from email.policy import default as email_policy
 from http import HTTPStatus
@@ -15,15 +16,21 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .chat import (
+    COMPACTION_SYSTEM_PROMPT,
+    DEFAULT_CONTEXT_BUDGET_CHARS,
+    DEFAULT_CONTEXT_SUMMARY_CHARS,
+    DEFAULT_CONTEXT_TAIL_CHARS,
     PARADIGMS,
     Conversation,
     ConversationStore,
     ProviderError,
     Router,
     adapter_for,
+    compaction_prompt,
     provider_specs,
     effort_options,
     normalize_effort,
+    render_turns,
     route_prompt,
     split_thinking,
     utc_now,
@@ -51,6 +58,10 @@ def _flag(value: Any) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+class ConversationBusy(RuntimeError):
+    """Raised when a turn is already running for one conversation."""
+
+
 def _system_prompt(paradigm: str) -> str:
     names = {
         "chunked_symbolism": "EN_ChunkedSymbolism_SystemPrompt.md",
@@ -67,10 +78,43 @@ class ChatApplication:
         self.router = Router()
         self._conversation_locks: dict[str, threading.Lock] = {}
         self._locks_lock = threading.Lock()
+        self._summary_locks: dict[str, threading.Lock] = {}
+        self._summary_running: set[str] = set()
+        self._sending: set[str] = set()
 
     def _lock_for(self, conversation_id: str) -> threading.Lock:
         with self._locks_lock:
             return self._conversation_locks.setdefault(conversation_id, threading.Lock())
+
+    def _summary_lock_for(self, conversation_id: str) -> threading.Lock:
+        with self._locks_lock:
+            return self._summary_locks.setdefault(conversation_id, threading.Lock())
+
+    @contextmanager
+    def _sending_guard(self, conversation_id: str):
+        """Claim a conversation for one turn, or fail fast if one is running."""
+
+        with self._locks_lock:
+            if conversation_id in self._sending:
+                raise ConversationBusy("a reply is already running for this conversation")
+            self._sending.add(conversation_id)
+        try:
+            yield
+        finally:
+            with self._locks_lock:
+                self._sending.discard(conversation_id)
+
+    @staticmethod
+    def _context_mode() -> str:
+        """How the transcript reaches the harness.
+
+        ``native`` (default) resumes the harness session and only uses a handoff
+        when none exists, so the harness keeps its own history. ``inject`` sends
+        the running summary plus the verbatim recent tail on every turn and
+        never resumes a native session, so context is provider-neutral.
+        """
+
+        return os.environ.get("SOT_CONTEXT_MODE", "native").strip().lower()
 
     def bootstrap(self) -> dict[str, Any]:
         return {
@@ -94,6 +138,9 @@ class ChatApplication:
             "plan_mode": conversation.plan_mode,
             "message_count": len(conversation.messages),
             "upload_count": len(conversation.uploads),
+            "context_upto": conversation.context_upto,
+            "context_summary_chars": len(conversation.context_summary),
+            "context_revision": conversation.context_revision,
         }
 
     def create(self, payload: dict[str, Any]) -> Conversation:
@@ -102,11 +149,36 @@ class ChatApplication:
         if provider not in {spec.key for spec in provider_specs()}:
             raise ValueError("unknown provider")
         conversation.provider = provider
-        conversation.model = str(payload.get("model") or "")[:200]
+        conversation.model = str(payload.get("model") or "").strip()[:200]
+        conversation.model_by_provider[provider] = conversation.model
         conversation.effort = normalize_effort(payload.get("effort"))
         conversation.plan_mode = _flag(payload.get("plan_mode", True))
         self.store.save(conversation)
         return conversation
+
+    def update_settings(self, conversation_id: str, payload: dict[str, Any]) -> Conversation:
+        """Persist harness/model/effort choices without running a turn.
+
+        This is the per-session cache the UI relies on: a selection is durable
+        even if the user closes the session before sending a message.
+        """
+
+        with self._lock_for(conversation_id):
+            conversation = self.store.load(conversation_id)
+            if payload.get("provider") is not None:
+                provider = str(payload["provider"])
+                if provider not in {spec.key for spec in provider_specs()}:
+                    raise ValueError("unknown provider")
+                conversation.provider = provider
+            if payload.get("model") is not None:
+                conversation.model = str(payload["model"]).strip()[:200]
+            if payload.get("effort") is not None:
+                conversation.effort = normalize_effort(payload["effort"])
+            if payload.get("plan_mode") is not None:
+                conversation.plan_mode = _flag(payload["plan_mode"])
+            conversation.model_by_provider[conversation.provider] = conversation.model
+            self.store.save(conversation)
+            return conversation
 
     def delete(self, conversation_id: str) -> None:
         self.store.delete(conversation_id)
@@ -184,7 +256,7 @@ class ChatApplication:
         if not text:
             raise ValueError("message is required")
 
-        with self._lock_for(conversation_id):
+        with self._sending_guard(conversation_id), self._lock_for(conversation_id):
             conversation = self.store.load(conversation_id)
             provider = str(payload.get("provider") or conversation.provider)
             model = str(payload.get("model") if payload.get("model") is not None else conversation.model).strip()[:200]
@@ -211,12 +283,16 @@ class ChatApplication:
 
             spec_key = f"{provider}:{model}"
             session = conversation.provider_sessions.get(spec_key, {})
-            native_session_id = session.get("session_id")
-            initial = not bool(native_session_id)
-            handoff = None
-            if not native_session_id and conversation.messages:
-                budget = int(os.environ.get("SOT_HANDOFF_MAX_CHARS", "24000"))
-                handoff = conversation.handoff(max_chars=max(4000, budget))
+            budget = _limit("SOT_CONTEXT_BUDGET_CHARS", DEFAULT_CONTEXT_BUDGET_CHARS)
+            tail = _limit("SOT_CONTEXT_TAIL_CHARS", DEFAULT_CONTEXT_TAIL_CHARS)
+            if self._context_mode() == "native":
+                native_session_id = session.get("session_id")
+                initial = not bool(native_session_id)
+                handoff = conversation.context_text(max_chars=max(4000, budget), tail_chars=tail) if not native_session_id else None
+            else:
+                native_session_id = None
+                initial = True
+                handoff = conversation.context_text(max_chars=max(4000, budget), tail_chars=tail) or None
 
             system_prompt = _system_prompt(paradigm)
             prompt = route_prompt(paradigm, "", text, handoff=handoff)
@@ -237,6 +313,7 @@ class ChatApplication:
             })
             conversation.provider = provider
             conversation.model = model
+            conversation.model_by_provider[provider] = model
             conversation.effort = effort
             conversation.plan_mode = plan_mode
             conversation.updated_at = utc_now()
@@ -276,9 +353,85 @@ class ChatApplication:
                 "session_id": result.session_id,
                 "updated_at": utc_now(),
             }
+            conversation.model_by_provider[provider] = model
             conversation.updated_at = utc_now()
             self.store.save(conversation)
+            self._schedule_compaction(conversation, provider, model)
             return conversation
+
+    def _schedule_compaction(
+        self,
+        conversation: Conversation,
+        provider: str,
+        model: str,
+    ) -> None:
+        """Fold turns that fell out of the verbatim tail into the running summary.
+
+        The merge runs on a daemon thread so a slow summarizer never blocks the
+        reply, and it re-checks the boundary before saving so a stale merge
+        cannot overwrite newer state.
+        """
+
+        if self._context_mode() == "native":
+            return
+        tail = _limit("SOT_CONTEXT_TAIL_CHARS", DEFAULT_CONTEXT_TAIL_CHARS)
+        target_upto = conversation.tail_start(tail)
+        if target_upto <= conversation.context_upto:
+            return
+        with self._summary_lock_for(conversation.id):
+            if conversation.id in self._summary_running:
+                return
+            self._summary_running.add(conversation.id)
+        threading.Thread(
+            target=self._compact,
+            args=(conversation.id, provider, model, target_upto, conversation.context_upto),
+            name=f"sot-compact-{conversation.id[:8]}",
+            daemon=True,
+        ).start()
+
+    def _compact(
+        self,
+        conversation_id: str,
+        provider: str,
+        model: str,
+        target_upto: int,
+        base_upto: int,
+    ) -> None:
+        try:
+            conversation = self.store.load(conversation_id)
+            if conversation.context_upto != base_upto or target_upto > len(conversation.messages):
+                return
+            turns = render_turns(conversation.messages[base_upto:target_upto])
+            if not turns.strip():
+                return
+            summary_chars = _limit("SOT_CONTEXT_SUMMARY_CHARS", DEFAULT_CONTEXT_SUMMARY_CHARS)
+            result = adapter_for(provider).invoke(
+                compaction_prompt(conversation.context_summary, turns, max_chars=summary_chars),
+                model=model,
+                native_session_id=None,
+                initial=True,
+                system_prompt=COMPACTION_SYSTEM_PROMPT,
+                cwd=os.environ.get("SOT_WORKDIR", os.getcwd()),
+                effort="",
+                plan_mode=True,
+            )
+            _, response = split_thinking(result.text, structured_thinking=result.thinking)
+            summary = (response or result.text or "").strip()
+            if not summary:
+                return
+            latest = self.store.load(conversation_id)
+            if latest.context_upto != base_upto:
+                return
+            latest.context_summary = summary[:summary_chars]
+            latest.context_upto = target_upto
+            latest.context_revision += 1
+            latest.updated_at = utc_now()
+            self.store.save(latest)
+        except Exception:
+            pass
+        finally:
+            with self._summary_lock_for(conversation_id):
+                self._summary_running.discard(conversation_id)
 
 
 INDEX_HTML = r'''<!doctype html>
@@ -292,7 +445,7 @@ INDEX_HTML = r'''<!doctype html>
 aside{border-right:1px solid var(--line);padding:16px;overflow:auto;background:#13161b}h1{font-size:16px;margin:0 0 14px}button,select,input,textarea{font:inherit;color:inherit;background:var(--panel);border:1px solid var(--line);border-radius:7px;padding:8px}button{cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}button:hover{border-color:var(--accent)}#new{width:100%;margin-bottom:14px}.conversation{display:block;width:100%;text-align:left;margin:5px 0;background:transparent;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.conversation.active{border-color:var(--accent);background:#1b2837}.small{font-size:12px;color:var(--muted)}main{display:grid;grid-template-rows:auto auto auto minmax(0,1fr) auto;min-width:0;min-height:0}.toolbar{padding:12px 18px;border-bottom:1px solid var(--line);display:flex;gap:8px;align-items:center;flex-wrap:wrap;min-width:0}.toolbar label{color:var(--muted);font-size:12px}.toolbar select{min-width:190px}.toolbar input{width:220px}.toolbar input.upload-input{width:235px;min-width:180px;padding:5px}.include-upload{display:flex;align-items:center;gap:4px;white-space:nowrap}.include-upload input{width:auto;padding:0}.plan-mode-group{display:none;align-items:center;gap:10px;font-size:12px;color:var(--muted);white-space:nowrap}.plan-mode-group.visible{display:flex}.plan-mode-group label{display:flex;align-items:center;gap:3px}.plan-mode-group input{width:auto;padding:0}.upload-status{font-size:12px;color:var(--muted);max-width:28ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.model-select{min-width:280px}.route{margin-left:auto;color:var(--accent);font-size:12px;border:1px solid var(--line);border-radius:999px;padding:5px 9px;background:#151c25;max-width:44ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.view-tabs{display:flex;gap:6px;padding:10px 18px 0}.view-tab{border-radius:999px;padding:5px 10px;color:var(--muted);background:transparent}.view-tab.active{color:#edf1f7;background:#25364a;border-color:#3975ad}.delete-session{width:100%;margin-top:5px;color:#f2a3a3}.chat{width:100%;min-width:0;min-height:0;overflow:auto;overscroll-behavior:contain;padding:24px max(18px,calc((100vw - 920px)/2));display:flex;flex-direction:column;align-items:stretch;gap:14px}.bubble{width:min(860px,100%);max-width:100%;min-width:0;border:1px solid var(--line);border-radius:10px;padding:12px 14px;white-space:pre-wrap;line-height:1.5;overflow:visible;overflow-wrap:anywhere;word-break:break-word}.bubble>div{max-width:100%;min-width:0;overflow:visible;overflow-wrap:anywhere;word-break:break-word}.bubble.user{align-self:flex-end;background:var(--user)}.bubble.assistant{align-self:flex-start;background:var(--assistant)}.meta{display:flex;align-items:center;gap:8px;font-size:11px;color:var(--muted);margin-bottom:6px}.copy-button{margin-left:auto;padding:2px 8px;font-size:11px;line-height:1.2;color:var(--muted);background:transparent}.composer{border-top:1px solid var(--line);padding:14px max(18px,calc((100vw - 920px)/2));display:flex;gap:8px}.composer textarea{resize:vertical;min-height:54px;flex:1}.composer button{align-self:flex-end;background:#254a70;border-color:#3975ad}.empty{color:var(--muted);margin:auto;text-align:center}.warning{color:#f2c879;font-size:12px;margin:0 18px 8px}@media(max-width:700px){body{grid-template-columns:1fr}aside{display:none}.route{width:100%;margin-left:0}.toolbar input{width:150px}}
 </style></head>
 <body><aside><h1>SoT planning chats</h1><button id="new">＋ New session</button><button id="delete" class="delete-session" disabled>Delete session</button><div id="sessions"></div><p class="small">The transcript is stored locally. Harness sessions stay native where supported; switching harnesses uses a bounded text handoff.</p></aside>
-<main><div class="toolbar"><label for="provider">Harness</label><select id="provider"></select><label for="model">Model</label><select id="model" class="model-select"></select><input id="custom-model" placeholder="Custom model ID (optional)"><label for="effort">Effort</label><select id="effort"></select><span class="plan-mode-group" id="plan-mode-group" title="Plan mode: read-only, no tools. Full access: tools enabled, permission prompts bypassed."><label><input type="radio" name="plan-mode" id="plan-mode-on" value="on"> Plan mode</label><label><input type="radio" name="plan-mode" id="plan-mode-off" value="off"> Full access</label></span><label for="upload-files">Context files</label><input id="upload-files" class="upload-input" type="file" multiple accept=".txt,.md,.csv,.json,.yaml,.yml,.xml,.html,.log,.py,.js,.ts,.rst,.tex,text/*"><label class="include-upload"><input id="include-uploads" type="checkbox"> Include uploaded texts in next prompt</label><button id="clear-uploads" type="button">Clear</button><span class="upload-status" id="upload-status">No uploaded texts</span><label for="paradigm">Router</label><select id="paradigm"><option value="auto">Auto</option><option value="conceptual_chaining">Conceptual chaining</option><option value="chunked_symbolism">Chunked symbolism</option><option value="expert_lexicons">Expert lexicons</option></select><span class="route" id="route">No turn yet</span></div> <nav class="view-tabs" aria-label="Chat view"><button class="view-tab active" data-view="response">Response log</button><button class="view-tab" data-view="thinking">Thinking log</button></nav><div class="warning" id="warning"></div><section class="chat" id="chat"><div class="empty">Create a session and start planning.</div></section><form class="composer" id="composer"><textarea id="message" placeholder="Describe what you are planning..."></textarea><button>Send</button></form></main>
+<main><div class="toolbar"><label for="provider">Harness</label><select id="provider"></select><label for="model">Model</label><select id="model" class="model-select"></select><input id="custom-model" placeholder="Custom model ID (optional)"><label for="effort">Effort</label><select id="effort"></select><span class="plan-mode-group" id="plan-mode-group" title="Plan mode: read-only, no tools. Full access: tools enabled, permission prompts bypassed."><label><input type="radio" name="plan-mode" id="plan-mode-on" value="on"> Plan mode</label><label><input type="radio" name="plan-mode" id="plan-mode-off" value="off"> Full access</label></span><label for="upload-files">Context files</label><input id="upload-files" class="upload-input" type="file" multiple accept=".txt,.md,.csv,.json,.yaml,.yml,.xml,.html,.log,.py,.js,.ts,.rst,.tex,text/*"><label class="include-upload"><input id="include-uploads" type="checkbox"> Include uploaded texts in next prompt</label><button id="clear-uploads" type="button">Clear</button><span class="upload-status" id="upload-status">No uploaded texts</span><label for="paradigm">Router</label><select id="paradigm"><option value="auto">Auto</option><option value="conceptual_chaining">Conceptual chaining</option><option value="chunked_symbolism">Chunked symbolism</option><option value="expert_lexicons">Expert lexicons</option></select><span class="upload-status" id="memory-status" title="Conversation context carried into each reply">Memory: new</span><span class="route" id="route">No turn yet</span></div> <nav class="view-tabs" aria-label="Chat view"><button class="view-tab active" data-view="response">Response log</button><button class="view-tab" data-view="thinking">Thinking log</button></nav><div class="warning" id="warning"></div><section class="chat" id="chat"><div class="empty">Create a session and start planning.</div></section><form class="composer" id="composer"><textarea id="message" placeholder="Describe what you are planning..."></textarea><button>Send</button></form></main>
 <script>
 let state={boot:null,conversation:null,view:"response",sending:false};
 const byId=id=>document.getElementById(id);
@@ -378,6 +531,7 @@ function splitThinking(content, thinkingHint, responseHint){
 }
 
 function setView(view){state.view=view;document.querySelectorAll(".view-tab").forEach(function(tab){tab.classList.toggle("active",tab.dataset.view===view);});renderChat();}
+function renderMemory(){let c=state.conversation;let element=byId("memory-status");if(!c){element.textContent="Memory: new";element.title="";return;}let total=c.messages.length;let upto=c.context_upto||0;let recent=Math.max(0,total-upto);if(c.context_summary){element.textContent="Memory: summary + "+recent+" recent turn"+(recent===1?"":"s");element.title=c.context_summary;}else{element.textContent="Memory: full transcript ("+total+" turn"+(total===1?"":"s")+")";element.title="No compaction yet; the whole transcript is carried.";}}
 function renderRouter(){let c=state.conversation;let assistant=c&&c.messages.slice().reverse().find(function(m){return m.role==="assistant";});let route=assistant&&assistant.router;if(!route&&c){let users=c.messages.filter(function(m){return m.role==="user";});route=users.length?users[users.length-1].router:null;}let routeElement=byId("route");if(!assistant||!route){routeElement.textContent="No turn yet";routeElement.title="The selected SoT paradigm will appear here.";return;}let confidence=route.confidence==null?"not available":String(route.confidence);let label=prettyParadigm(assistant.paradigm||route.paradigm);let detail="Last: "+label+" | "+(route.backend||"unknown")+" | confidence "+confidence+" | "+(assistant.provider||"unknown")+" / "+(assistant.model||"harness default");routeElement.textContent=detail;routeElement.title=detail;}
 function updateDeleteButton(){byId("delete").disabled=!state.conversation;}
 function renderSessions(){let container=byId("sessions");container.innerHTML="";(state.boot.conversations||[]).forEach(function(c){let button=document.createElement("button");button.className="conversation "+(state.conversation&&state.conversation.id===c.id?"active":"");button.textContent=c.title;button.dataset.id=c.id;button.onclick=function(){openConversation(c.id);};container.appendChild(button);});updateDeleteButton();}
@@ -434,26 +588,34 @@ function addBubble(container,message,content,metaText){
 }
 
 
-function renderChat(){renderRouter();let c=state.conversation;let container=byId("chat");if(!c||!c.messages.length){container.innerHTML="";let empty=document.createElement("div");empty.className="empty";empty.textContent="Start a planning session.";container.appendChild(empty);return;}container.innerHTML="";let foundThinking=false;if(state.view==="thinking"){c.messages.forEach(function(m){if(m.role!=="assistant")return;let parts=splitThinking(m.content,m.thinking,m.response);if(!parts.thinking)return;foundThinking=true;addBubble(container,m,parts.thinking,(m.provider||"assistant")+" | "+(m.paradigm||"")+" | thinking");});if(!foundThinking){let empty=document.createElement("div");empty.className="empty";empty.textContent="No thinking blocks were returned by the selected harness.";container.appendChild(empty);}}else{c.messages.forEach(function(m){if(m.role==="assistant"){let parts=splitThinking(m.content,m.thinking,m.response);addBubble(container,m,parts.response||"(thinking block only)",(m.provider||"assistant")+" | "+(m.paradigm||"")+" | response");}else{addBubble(container,m,m.content,"You | "+(m.paradigm||""));}});}container.scrollTop=container.scrollHeight;}
+function renderChat(){renderRouter();renderMemory();let c=state.conversation;let container=byId("chat");if(!c||!c.messages.length){container.innerHTML="";let empty=document.createElement("div");empty.className="empty";empty.textContent="Start a planning session.";container.appendChild(empty);return;}container.innerHTML="";let foundThinking=false;if(state.view==="thinking"){c.messages.forEach(function(m){if(m.role!=="assistant")return;let parts=splitThinking(m.content,m.thinking,m.response);if(!parts.thinking)return;foundThinking=true;addBubble(container,m,parts.thinking,(m.provider||"assistant")+" | "+(m.paradigm||"")+" | thinking");});if(!foundThinking){let empty=document.createElement("div");empty.className="empty";empty.textContent="No thinking blocks were returned by the selected harness.";container.appendChild(empty);}}else{c.messages.forEach(function(m){if(m.role==="assistant"){let parts=splitThinking(m.content,m.thinking,m.response);addBubble(container,m,parts.response||"(thinking block only)",(m.provider||"assistant")+" | "+(m.paradigm||"")+" | response");}else{addBubble(container,m,m.content,"You | "+(m.paradigm||""));}});}container.scrollTop=container.scrollHeight;}
 async function openConversation(id){state.conversation=await api("/api/conversations/"+encodeURIComponent(id));byId("provider").value=state.conversation.provider;byId("include-uploads").checked=false;renderModels();renderEfforts();renderPlanMode();renderUploads();renderSessions();renderChat();}
 async function newConversation(){let title=window.prompt("Name this planning session","New planning session");if(title===null)return;title=title.trim()||"New planning session";let c=await api("/api/conversations",{method:"POST",body:JSON.stringify({title:title,provider:byId("provider").value,model:selectedModel(),effort:selectedEffort(),plan_mode:selectedPlanMode()})});state.boot.conversations.unshift({id:c.id,title:c.title,provider:c.provider,model:c.model,effort:c.effort,plan_mode:c.plan_mode,updated_at:c.updated_at,message_count:0,upload_count:0});state.conversation=c;byId("include-uploads").checked=false;renderModels();renderEfforts();renderPlanMode();renderUploads();renderSessions();renderChat();}
 async function deleteConversation(){if(!state.conversation||state.sending)return;let currentId=state.conversation.id;if(window.confirm("Delete session: "+state.conversation.title+"?")===false)return;let button=byId("delete");button.disabled=true;try{await api("/api/conversations/"+encodeURIComponent(currentId),{method:"DELETE"});state.boot.conversations=state.boot.conversations.filter(function(c){return c.id!==currentId;});state.conversation=null;if(state.boot.conversations.length)await openConversation(state.boot.conversations[0].id);else{renderSessions();renderUploads();renderChat();}}catch(e){byId("warning").textContent=e.message;updateDeleteButton();}}
 async function send(){let text=byId("message").value.trim();if(!text||!state.conversation||state.sending)return;let button=document.querySelector(".composer button");let conversationId=state.conversation.id;let runningMessage="Running the selected harness...";state.sending=true;button.disabled=true;button.textContent="Routing...";byId("warning").textContent=runningMessage;try{let result=await api("/api/conversations/"+encodeURIComponent(conversationId)+"/messages",{method:"POST",body:JSON.stringify({message:text,provider:byId("provider").value,model:selectedModel(),effort:selectedEffort(),plan_mode:selectedPlanMode(),paradigm:byId("paradigm").value,include_uploads:byId("include-uploads").checked})});if(state.conversation&&state.conversation.id===conversationId){state.conversation=result;byId("include-uploads").checked=false;}byId("message").value="";let c=state.boot.conversations.find(function(x){return x.id===conversationId;});if(c){c.message_count=result.messages.length;c.upload_count=(result.uploads||[]).length;c.updated_at=result.updated_at;c.provider=result.provider;c.model=result.model;c.effort=result.effort;c.plan_mode=result.plan_mode;}if(state.conversation&&state.conversation.id===conversationId){renderModels();renderEfforts();renderPlanMode();renderSessions();renderChat();}}catch(e){byId("warning").textContent=e.message;}finally{state.sending=false;button.disabled=false;button.textContent="Send";renderUploads();if(byId("warning").textContent===runningMessage)byId("warning").textContent="";}}
 async function boot(){state.boot=await api("/api/bootstrap");renderProviders();renderSessions();if(state.boot.conversations.length)await openConversation(state.boot.conversations[0].id);else{renderUploads();renderChat();}}
-byId("new").onclick=newConversation;byId("delete").onclick=deleteConversation;byId("upload-files").onchange=uploadFiles;byId("clear-uploads").onclick=clearUploads;byId("provider").onchange=function(){if(state.conversation){state.conversation.model="";}byId("custom-model").value="";renderModels();renderEfforts();renderPlanMode();};byId("model").onchange=function(){byId("custom-model").value="";renderEfforts();};byId("custom-model").oninput=function(){renderEfforts();};byId("composer").onsubmit=function(e){e.preventDefault();send();};document.querySelectorAll(".view-tab").forEach(function(tab){tab.onclick=function(){setView(tab.dataset.view);};});boot().catch(function(e){byId("warning").textContent=e.message;});
+let settingsTimer=null;
+function saveSettings(){if(!state.conversation)return;clearTimeout(settingsTimer);settingsTimer=setTimeout(async function(){try{let result=await api("/api/conversations/"+encodeURIComponent(state.conversation.id),{method:"PATCH",body:JSON.stringify({provider:byId("provider").value,model:selectedModel(),effort:selectedEffort(),plan_mode:selectedPlanMode()})});state.conversation.model_by_provider=result.model_by_provider;let summary=state.boot.conversations.find(function(x){return x.id===result.id;});if(summary){summary.provider=result.provider;summary.model=result.model;summary.effort=result.effort;summary.plan_mode=result.plan_mode;}}catch(error){byId("warning").textContent=error.message;}},250);}
+byId("new").onclick=newConversation;byId("delete").onclick=deleteConversation;byId("upload-files").onchange=uploadFiles;byId("clear-uploads").onclick=clearUploads;byId("provider").onchange=function(){if(state.conversation){let remembered=(state.conversation.model_by_provider||{})[byId("provider").value];state.conversation.model=remembered||"";byId("custom-model").value="";}renderModels();renderEfforts();renderPlanMode();saveSettings();};byId("model").onchange=function(){byId("custom-model").value="";renderEfforts();saveSettings();};byId("custom-model").oninput=function(){renderEfforts();saveSettings();};byId("effort").onchange=saveSettings;byId("plan-mode-on").onchange=saveSettings;byId("plan-mode-off").onchange=saveSettings;byId("composer").onsubmit=function(e){e.preventDefault();send();};document.querySelectorAll(".view-tab").forEach(function(tab){tab.onclick=function(){setView(tab.dataset.view);};});boot().catch(function(e){byId("warning").textContent=e.message;});
 </script></body></html>''';
 
 
 class RequestHandler(BaseHTTPRequestHandler):
     app: ChatApplication
 
+    def _write(self, status: int, content_type: str, body: bytes) -> None:
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except ConnectionError:
+            self.close_connection = True
+
     def _json(self, status: int, payload: Any) -> None:
         encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(encoded)))
-        self.end_headers()
-        self.wfile.write(encoded)
+        self._write(status, "application/json; charset=utf-8", encoded)
 
     def _body(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))
@@ -499,12 +661,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         try:
             if path == "/":
-                encoded = INDEX_HTML.encode("utf-8")
-                self.send_response(HTTPStatus.OK)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(encoded)))
-                self.end_headers()
-                self.wfile.write(encoded)
+                self._write(HTTPStatus.OK, "text/html; charset=utf-8", INDEX_HTML.encode("utf-8"))
                 return
             if path == "/api/bootstrap":
                 self._json(HTTPStatus.OK, self.app.bootstrap())
@@ -515,6 +672,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, conversation.as_dict())
                 return
             self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+        except ConnectionError:
+            self.close_connection = True
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
 
@@ -539,8 +698,26 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, self.app.send(conversation_id, payload).as_dict())
                 return
             self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+        except ConversationBusy as exc:
+            self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
         except ProviderError as exc:
             self._json(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
+        except ConnectionError:
+            self.close_connection = True
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+
+    def do_PATCH(self) -> None:  # noqa: N802
+        path = urlparse(self.path).path
+        prefix = "/api/conversations/"
+        try:
+            if not path.startswith(prefix) or path.endswith("/messages") or path.endswith("/uploads"):
+                self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+                return
+            conversation_id = path[len(prefix):]
+            self._json(HTTPStatus.OK, self.app.update_settings(conversation_id, self._body()).as_dict())
+        except ConnectionError:
+            self.close_connection = True
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
 
@@ -558,6 +735,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, {"deleted": True})
                 return
             self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+        except ConnectionError:
+            self.close_connection = True
         except (OSError, ValueError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
 
@@ -582,10 +761,40 @@ def serve(host: str = "127.0.0.1", port: int = 8787) -> None:
 def main() -> None:
     import argparse
 
-    parser = argparse.ArgumentParser(description="Run the local Sketch-of-Thought planning chat")
+    parser = argparse.ArgumentParser(
+        description="Run the local Sketch-of-Thought planning chat",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Environment knobs:\n"
+            "  SOT_CHAT_HOST               Bind address (default 127.0.0.1)\n"
+            "  SOT_CHAT_PORT               Bind port (default 8787)\n"
+            "  SOT_CONTEXT_MODE            inject | native (default native).\n"
+            "                              native: resume the harness session and use a text\n"
+            "                                      handoff only when none exists.\n"
+            "                              inject: send the running summary plus recent turns on\n"
+            "                                      every reply and never resume a native session.\n"
+            "  SOT_CONTEXT_BUDGET_CHARS    Max working-context characters (default 24000)\n"
+            "  SOT_CONTEXT_TAIL_CHARS      Verbatim recent-turn window (default 8000)\n"
+            "  SOT_CONTEXT_SUMMARY_CHARS   Max running-summary length (default 4000)\n"
+            "  SOT_WORKDIR                 Working directory for harness calls\n"
+            "  SOT_PROVIDER_TIMEOUT        Harness timeout in seconds (default 900)\n"
+            "  SOT_UPLOAD_MAX_FILES        Max uploaded files per conversation (default 50)\n"
+            "  SOT_UPLOAD_MAX_FILE_BYTES   Max bytes per uploaded file (default 1000000)\n"
+            "  SOT_UPLOAD_MAX_TOTAL_BYTES  Max uploaded bytes per conversation (default 6000000)\n"
+            "  SOT_UPLOAD_MAX_CONTEXT_CHARS Max uploaded-context characters (default 120000)\n"
+            "  SOT_CHAT_QUIET              Set to 1 to silence HTTP request logs\n"
+        ),
+    )
     parser.add_argument("--host", default=os.environ.get("SOT_CHAT_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("SOT_CHAT_PORT", "8787")))
+    parser.add_argument(
+        "--context-mode",
+        choices=("inject", "native"),
+        default=os.environ.get("SOT_CONTEXT_MODE", "native").strip().lower() or "native",
+        help="How conversation context reaches the harness (default: native)",
+    )
     args = parser.parse_args()
+    os.environ["SOT_CONTEXT_MODE"] = args.context_mode
     serve(args.host, args.port)
 
 

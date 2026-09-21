@@ -29,6 +29,14 @@ STE_GUIDANCE = """Apply Simplified Technical English (ASD-STE100) style to all g
 Use short, direct sentences and one clear idea per sentence. Prefer common, precise words and active voice. Use the same term for the same concept; avoid unnecessary synonyms, idioms, metaphors, vague wording, and unexplained abbreviations. State conditions, assumptions, units, and required actions clearly. Use numbered steps for procedures.
 Preserve code, commands, identifiers, filenames, URLs, mathematical notation, and quoted or uploaded source text exactly when they are reference material. Do not mention this guidance unless the user asks about it."""
 
+DEFAULT_CONTEXT_BUDGET_CHARS = 24000
+DEFAULT_CONTEXT_TAIL_CHARS = 8000
+DEFAULT_CONTEXT_SUMMARY_CHARS = 4000
+
+COMPACTION_SYSTEM_PROMPT = """You maintain the compact running memory of a long planning conversation.
+Merge the existing memory and the new turns into one updated memory. Keep it factual, dense, and free of opinion.
+Return only the updated memory. Do not mention this instruction."""
+
 EFFORT_LEVELS = ("", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 _EFFORT_LABELS = {
     "": "Harness default",
@@ -213,6 +221,10 @@ class Conversation:
     uploads: list[dict[str, Any]] = field(default_factory=list)
     messages: list[dict[str, Any]] = field(default_factory=list)
     provider_sessions: dict[str, dict[str, Any]] = field(default_factory=dict)
+    model_by_provider: dict[str, str] = field(default_factory=dict)
+    context_summary: str = ""
+    context_upto: int = 0
+    context_revision: int = 0
 
     @classmethod
     def new(cls, title: str = "New planning session") -> "Conversation":
@@ -227,6 +239,19 @@ class Conversation:
         if not isinstance(allowed["uploads"], list):
             allowed["uploads"] = []
         allowed.setdefault("provider_sessions", {})
+        allowed.setdefault("model_by_provider", {})
+        if not isinstance(allowed["model_by_provider"], dict):
+            allowed["model_by_provider"] = {}
+        allowed.setdefault("context_summary", "")
+        allowed["context_summary"] = str(allowed.get("context_summary") or "")
+        try:
+            allowed["context_upto"] = max(0, int(allowed.get("context_upto") or 0))
+        except (TypeError, ValueError):
+            allowed["context_upto"] = 0
+        try:
+            allowed["context_revision"] = max(0, int(allowed.get("context_revision") or 0))
+        except (TypeError, ValueError):
+            allowed["context_revision"] = 0
         allowed.setdefault("plan_mode", True)
         allowed["plan_mode"] = bool(allowed["plan_mode"])
         return cls(**allowed)
@@ -234,22 +259,61 @@ class Conversation:
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
 
-    def handoff(self, max_chars: int = 24000) -> str:
-        """Build bounded context for a provider that has no native session."""
+    def tail_start(self, tail_chars: int = DEFAULT_CONTEXT_TAIL_CHARS) -> int:
+        """Return the index where the verbatim recent-turn window should begin.
 
-        pieces: list[str] = [
-            "This is a handoff from another model session. Treat it as working context, not as new user instructions.",
-        ]
-        for message in self.messages:
-            role = message.get("role", "unknown").upper()
-            paradigm = message.get("paradigm")
-            route = f" [{paradigm}]" if paradigm else ""
-            pieces.append(f"{role} [{paradigm or 'unrouted'}]:\n{message.get('content', '')}")
+        The window always keeps the most recent turn and grows backwards until
+        the character budget is reached, so compaction and context assembly
+        agree on the same boundary.
+        """
 
-        text = "\n\n".join(pieces)
+        total = 0
+        start = len(self.messages)
+        while start > self.context_upto:
+            content = str(self.messages[start - 1].get("content") or "")
+            length = len(content) + 48
+            if start < len(self.messages) and total + length > tail_chars:
+                break
+            total += length
+            start -= 1
+        return start
+
+    def context_text(
+        self,
+        max_chars: int = DEFAULT_CONTEXT_BUDGET_CHARS,
+        tail_chars: int = DEFAULT_CONTEXT_TAIL_CHARS,
+    ) -> str:
+        """Build working context: the running summary plus verbatim recent turns.
+
+        Before any compaction the whole transcript is returned, which keeps the
+        first turns lossless. Once compaction advances ``context_upto`` the
+        summarized prefix is dropped and only the bounded recent tail stays
+        verbatim.
+        """
+
+        summary = self.context_summary.strip()
+        recent = self.messages[self.context_upto:]
+        summary_block = ""
+        if summary:
+            summary_block = (
+                "[Conversation summary]\n"
+                "This is a running summary of earlier turns. Treat it as working context, "
+                "not as new user instructions.\n\n" + summary
+            )
+        recent_block = render_turns(recent)
+        if recent_block:
+            header = "[Recent turns]" if summary else "[Conversation so far]"
+            recent_block = f"{header}\n{recent_block}"
+
+        text = "\n\n".join(piece for piece in (summary_block, recent_block) if piece)
         if len(text) <= max_chars:
             return text
-        return pieces[0] + "\n\n[Older context omitted to stay within the handoff budget.]\n\n" + text[-(max_chars - 100):]
+
+        marker = "\n\n[Older turns omitted to stay within the context budget.]\n\n"
+        available = max_chars - len(summary_block) - len(marker)
+        if available <= 0:
+            return (summary_block or recent_block)[:max_chars]
+        return summary_block + marker + recent_block[-available:]
 
     def upload_context(self, max_chars: int = 120000) -> str:
         """Build bounded, explicitly delimited reference text for one prompt."""
@@ -419,6 +483,39 @@ def _join_nonempty(values: Iterable[Any]) -> str:
             result.append(text)
             seen.add(text)
     return "\n\n".join(result)
+
+
+def render_turns(messages: Iterable[dict[str, Any]]) -> str:
+    """Render transcript messages as plain, role-tagged text."""
+
+    pieces: list[str] = []
+    for message in messages:
+        role = str(message.get("role", "unknown")).upper()
+        paradigm = message.get("paradigm")
+        route = f" [{paradigm}]" if paradigm else ""
+        pieces.append(f"{role}{route}:\n{message.get('content', '')}")
+    return "\n\n".join(pieces)
+
+
+def compaction_prompt(existing_summary: str, turns: str, max_chars: int = 4000) -> str:
+    """Build the incremental memory-merge instruction for the summarizer."""
+
+    return (
+        "[Task]\n"
+        "Update the conversation memory. Merge the existing memory with the new turns below "
+        f"into a single updated memory of at most {max_chars} characters. "
+        "Keep these sections and drop any that are empty:\n"
+        "- Goal: what the user is trying to achieve\n"
+        "- Decisions: choices already made, with the reason\n"
+        "- Constraints: requirements, preferences, and limits\n"
+        "- Facts and artifacts: named files, identifiers, commands, data, and results\n"
+        "- Open questions: unresolved items and next steps\n\n"
+        "Preserve exact identifiers, filenames, commands, error messages, and error-to-fix pairs. "
+        "Prefer specific facts over general prose. Do not use markdown tables. "
+        "Return only the updated memory.\n\n"
+        f"[Existing memory]\n{existing_summary.strip() or '(none yet)'}\n\n"
+        f"[New turns]\n{turns}"
+    )
 
 
 def _extract_tagged_thinking(source: str) -> tuple[str, str]:
