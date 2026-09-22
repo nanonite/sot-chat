@@ -118,7 +118,7 @@ def _claude_models() -> list[dict[str, Any]]:
     if not shutil.which("claude"):
         return []
     configured = [item.strip() for item in os.environ.get("SOT_CLAUDE_MODELS", "").split(",") if item.strip()]
-    values = configured or ["sonnet", "opus", "fable"]
+    values = configured or ["fable", "opus", "sonnet", "haiku"]
     return [_option("claude", item, item, "Claude CLI alias/configuration") for item in values]
 
 
