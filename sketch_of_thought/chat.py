@@ -13,9 +13,11 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
 import threading
+import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -409,6 +411,10 @@ class ProviderError(RuntimeError):
     pass
 
 
+class ProviderCancelled(ProviderError):
+    """Raised when the user stops a running harness call."""
+
+
 _THINKING_TAG_RE = re.compile(
     r"<\s*(think|thinking|analysis|reasoning)\s*>([\s\S]*?)"
     r"<\s*/\s*(think|thinking|analysis|reasoning)\s*>",
@@ -582,41 +588,98 @@ class ProviderAdapter:
         cwd: str,
         effort: str = "",
         plan_mode: bool = True,
+        cancel: threading.Event | None = None,
     ) -> InvocationResult:
         raise NotImplementedError
 
     @staticmethod
-    def _run(argv: list[str], *, prompt: str, cwd: str) -> str:
+    def _terminate(process: subprocess.Popen) -> None:
+        """Stop a harness process group, escalating from SIGTERM to SIGKILL."""
+
+        if process.poll() is not None:
+            return
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                process.terminate()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=5)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                process.kill()
+            except OSError:
+                pass
+
+    @staticmethod
+    def _run(
+        argv: list[str],
+        *,
+        prompt: str,
+        cwd: str,
+        cancel: threading.Event | None = None,
+    ) -> str:
         timeout = int(os.environ.get("SOT_PROVIDER_TIMEOUT", "900"))
         try:
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 argv,
-                input=prompt,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                capture_output=True,
                 cwd=cwd,
-                timeout=timeout,
-                check=False,
+                start_new_session=True,
             )
         except FileNotFoundError as exc:
             raise ProviderError(f"{argv[0]} is not installed or is not on PATH") from exc
-        except subprocess.TimeoutExpired as exc:
-            raise ProviderError(f"{argv[0]} timed out after {timeout}s") from exc
-        if completed.returncode != 0:
+
+        outcome: dict[str, Any] = {}
+
+        def communicate() -> None:
+            try:
+                outcome["stdout"], outcome["stderr"] = process.communicate(input=prompt)
+            except Exception as exc:  # pragma: no cover - defensive
+                outcome["error"] = exc
+
+        worker = threading.Thread(target=communicate, daemon=True)
+        worker.start()
+        deadline = time.monotonic() + timeout
+        while worker.is_alive():
+            worker.join(timeout=0.2)
+            if cancel is not None and cancel.is_set():
+                ProviderAdapter._terminate(process)
+                worker.join(timeout=5)
+                raise ProviderCancelled(f"{argv[0]} was stopped")
+            if time.monotonic() > deadline:
+                ProviderAdapter._terminate(process)
+                worker.join(timeout=5)
+                raise ProviderError(f"{argv[0]} timed out after {timeout}s")
+
+        if "error" in outcome:
+            raise ProviderError(f"{argv[0]} failed to run: {outcome['error']}")
+
+        stdout = outcome.get("stdout") or ""
+        stderr = outcome.get("stderr") or ""
+        if process.returncode != 0:
             diagnostics = []
-            stderr = (completed.stderr or "").strip()
-            stdout = (completed.stdout or "").strip()
-            if stderr:
-                diagnostics.append(f"stderr: {stderr}")
-            if stdout:
-                diagnostics.append(f"stdout: {stdout}")
+            if stderr.strip():
+                diagnostics.append(f"stderr: {stderr.strip()}")
+            if stdout.strip():
+                diagnostics.append(f"stdout: {stdout.strip()}")
             detail = "\n".join(diagnostics) or "no diagnostics returned"
-            raise ProviderError(f"{argv[0]} exited with status {completed.returncode}: {detail[-1600:]}")
-        return completed.stdout.strip()
+            raise ProviderError(f"{argv[0]} exited with status {process.returncode}: {detail[-1600:]}")
+        return stdout.strip()
 
 
 class ClaudeAdapter(ProviderAdapter):
-    def invoke(self, prompt: str, *, model: str, native_session_id: str | None, initial: bool, system_prompt: str, cwd: str, effort: str = "", plan_mode: bool = True) -> InvocationResult:
+    def invoke(self, prompt: str, *, model: str, native_session_id: str | None, initial: bool, system_prompt: str, cwd: str, effort: str = "", plan_mode: bool = True, cancel: threading.Event | None = None) -> InvocationResult:
         argv = [self.spec.executable, "-p", "--output-format", "json"]
         if plan_mode:
             # Read-only: no tools registered, and the harness is locked to plan mode.
@@ -632,7 +695,7 @@ class ClaudeAdapter(ProviderAdapter):
             argv += ["--session-id", native_session_id or str(uuid.uuid4()), "--system-prompt", system_prompt]
         elif native_session_id:
             argv += ["--resume", native_session_id]
-        output = self._run(argv, prompt=prompt, cwd=cwd)
+        output = self._run(argv, prompt=prompt, cwd=cwd, cancel=cancel)
         try:
             payload = json.loads(output)
         except json.JSONDecodeError:
@@ -721,7 +784,7 @@ def _find_text(events: list[Any]) -> str | None:
 
 
 class CodexAdapter(ProviderAdapter):
-    def invoke(self, prompt: str, *, model: str, native_session_id: str | None, initial: bool, system_prompt: str, cwd: str, effort: str = "", plan_mode: bool = True) -> InvocationResult:
+    def invoke(self, prompt: str, *, model: str, native_session_id: str | None, initial: bool, system_prompt: str, cwd: str, effort: str = "", plan_mode: bool = True, cancel: threading.Event | None = None) -> InvocationResult:
         argv = [self.spec.executable, "exec", "--json", "--skip-git-repo-check", "--sandbox", "read-only"]
         if model:
             argv += ["--model", model]
@@ -731,7 +794,7 @@ class CodexAdapter(ProviderAdapter):
         else:
             argv += ["resume", native_session_id or ""]
             effective_prompt = prompt
-        output = self._run(argv, prompt=effective_prompt, cwd=cwd)
+        output = self._run(argv, prompt=effective_prompt, cwd=cwd, cancel=cancel)
         events = list(_json_lines(output))
         return InvocationResult(
             _find_text(events) or output,
@@ -742,7 +805,7 @@ class CodexAdapter(ProviderAdapter):
 
 
 class OpenCodeAdapter(ProviderAdapter):
-    def invoke(self, prompt: str, *, model: str, native_session_id: str | None, initial: bool, system_prompt: str, cwd: str, effort: str = "", plan_mode: bool = True) -> InvocationResult:
+    def invoke(self, prompt: str, *, model: str, native_session_id: str | None, initial: bool, system_prompt: str, cwd: str, effort: str = "", plan_mode: bool = True, cancel: threading.Event | None = None) -> InvocationResult:
         argv = [self.spec.executable, "run", "--format", "json", "--dir", cwd]
         if model:
             argv += ["--model", model]
@@ -752,7 +815,7 @@ class OpenCodeAdapter(ProviderAdapter):
         else:
             argv += ["--session", native_session_id or ""]
             effective_prompt = prompt
-        output = self._run(argv, prompt=effective_prompt, cwd=cwd)
+        output = self._run(argv, prompt=effective_prompt, cwd=cwd, cancel=cancel)
         events = list(_json_lines(output))
         return InvocationResult(
             _find_text(events) or output,
