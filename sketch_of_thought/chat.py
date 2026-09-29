@@ -22,10 +22,14 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 
 PARADIGMS = ("chunked_symbolism", "conceptual_chaining", "expert_lexicons")
+
+# A harness adapter reports coarse progress as it streams output. Events are
+# plain dicts so they can cross the HTTP boundary without a schema migration.
+ProgressCallback = Callable[[dict[str, Any]], None]
 
 STE_GUIDANCE = """Apply Simplified Technical English (ASD-STE100) style to all generated explanatory prose.
 Use short, direct sentences and one clear idea per sentence. Prefer common, precise words and active voice. Use the same term for the same concept; avoid unnecessary synonyms, idioms, metaphors, vague wording, and unexplained abbreviations. State conditions, assumptions, units, and required actions clearly. Use numbered steps for procedures.
@@ -589,6 +593,8 @@ class ProviderAdapter:
         effort: str = "",
         plan_mode: bool = True,
         cancel: threading.Event | None = None,
+        timeout: int | None = None,
+        progress: ProgressCallback | None = None,
     ) -> InvocationResult:
         raise NotImplementedError
 
@@ -619,14 +625,30 @@ class ProviderAdapter:
                 pass
 
     @staticmethod
+    def _drain(threads: list[threading.Thread], timeout: float = 5.0) -> None:
+        """Wait for the reader threads without hanging on a lingering child.
+
+        A harness may leave a grandchild holding the inherited stdout/stderr
+        pipe open after the parent exits. Joining with a bound keeps one stuck
+        child from freezing the whole turn.
+        """
+
+        deadline = time.monotonic() + timeout
+        for thread in threads:
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+
+    @staticmethod
     def _run(
         argv: list[str],
         *,
         prompt: str,
         cwd: str,
         cancel: threading.Event | None = None,
+        timeout: int | None = None,
+        on_line: Callable[[str], None] | None = None,
     ) -> str:
-        timeout = int(os.environ.get("SOT_PROVIDER_TIMEOUT", "900"))
+        if timeout is None:
+            timeout = int(os.environ.get("SOT_PROVIDER_TIMEOUT", "900"))
         try:
             process = subprocess.Popen(
                 argv,
@@ -636,37 +658,58 @@ class ProviderAdapter:
                 text=True,
                 cwd=cwd,
                 start_new_session=True,
+                bufsize=1,
             )
         except FileNotFoundError as exc:
             raise ProviderError(f"{argv[0]} is not installed or is not on PATH") from exc
 
-        outcome: dict[str, Any] = {}
+        stdout_chunks: list[str] = []
+        stderr_chunks: list[str] = []
 
-        def communicate() -> None:
+        def feed_stdin() -> None:
             try:
-                outcome["stdout"], outcome["stderr"] = process.communicate(input=prompt)
-            except Exception as exc:  # pragma: no cover - defensive
-                outcome["error"] = exc
+                if process.stdin is not None:
+                    process.stdin.write(prompt)
+                    process.stdin.close()
+            except (BrokenPipeError, OSError, ValueError):
+                pass
 
-        worker = threading.Thread(target=communicate, daemon=True)
-        worker.start()
-        deadline = time.monotonic() + timeout
-        while worker.is_alive():
-            worker.join(timeout=0.2)
+        def pump(stream: Any, sink: list[str], emit: bool) -> None:
+            try:
+                for line in stream:
+                    sink.append(line)
+                    if emit and on_line is not None:
+                        try:
+                            on_line(line.rstrip("\n"))
+                        except Exception:  # progress must never break the turn
+                            pass
+            except (OSError, ValueError):
+                pass
+
+        readers = [
+            threading.Thread(target=pump, args=(process.stdout, stdout_chunks, True), daemon=True),
+            threading.Thread(target=pump, args=(process.stderr, stderr_chunks, False), daemon=True),
+        ]
+        feeder = threading.Thread(target=feed_stdin, daemon=True)
+        feeder.start()
+        for reader in readers:
+            reader.start()
+
+        deadline = time.monotonic() + max(1, timeout)
+        while process.poll() is None:
             if cancel is not None and cancel.is_set():
                 ProviderAdapter._terminate(process)
-                worker.join(timeout=5)
+                ProviderAdapter._drain([feeder, *readers])
                 raise ProviderCancelled(f"{argv[0]} was stopped")
             if time.monotonic() > deadline:
                 ProviderAdapter._terminate(process)
-                worker.join(timeout=5)
+                ProviderAdapter._drain([feeder, *readers])
                 raise ProviderError(f"{argv[0]} timed out after {timeout}s")
+            time.sleep(0.1)
 
-        if "error" in outcome:
-            raise ProviderError(f"{argv[0]} failed to run: {outcome['error']}")
-
-        stdout = outcome.get("stdout") or ""
-        stderr = outcome.get("stderr") or ""
+        ProviderAdapter._drain([feeder, *readers])
+        stdout = "".join(stdout_chunks)
+        stderr = "".join(stderr_chunks)
         if process.returncode != 0:
             diagnostics = []
             if stderr.strip():
@@ -679,7 +722,7 @@ class ProviderAdapter:
 
 
 class ClaudeAdapter(ProviderAdapter):
-    def invoke(self, prompt: str, *, model: str, native_session_id: str | None, initial: bool, system_prompt: str, cwd: str, effort: str = "", plan_mode: bool = True, cancel: threading.Event | None = None) -> InvocationResult:
+    def invoke(self, prompt: str, *, model: str, native_session_id: str | None, initial: bool, system_prompt: str, cwd: str, effort: str = "", plan_mode: bool = True, cancel: threading.Event | None = None, timeout: int | None = None, progress: ProgressCallback | None = None) -> InvocationResult:
         argv = [self.spec.executable, "-p", "--output-format", "json"]
         if plan_mode:
             # Read-only: no tools registered, and the harness is locked to plan mode.
@@ -695,7 +738,7 @@ class ClaudeAdapter(ProviderAdapter):
             argv += ["--session-id", native_session_id or str(uuid.uuid4()), "--system-prompt", system_prompt]
         elif native_session_id:
             argv += ["--resume", native_session_id]
-        output = self._run(argv, prompt=prompt, cwd=cwd, cancel=cancel)
+        output = self._run(argv, prompt=prompt, cwd=cwd, cancel=cancel, timeout=timeout)
         try:
             payload = json.loads(output)
         except json.JSONDecodeError:
@@ -783,8 +826,62 @@ def _find_text(events: list[Any]) -> str | None:
     return (preferred[-1] if preferred else candidates[-1]) if candidates else None
 
 
+def _json_line(line: str) -> Any:
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        return json.loads(line)
+    except json.JSONDecodeError:
+        return None
+
+
+def _progress_event(line: str) -> dict[str, Any] | None:
+    """Normalize one JSON event line from a harness into a UI progress event.
+
+    Codex ``exec --json`` streams ``thread.started``, ``item.started`` /
+    ``item.completed`` and ``turn.completed`` events. We map the ones that show
+    visible work (reasoning, commands, web searches, messages) so the UI can
+    prove the model is making progress instead of waiting on silence.
+    """
+
+    event = _json_line(line)
+    if not isinstance(event, dict):
+        return None
+    kind = str(event.get("type") or "")
+    if kind == "thread.started":
+        return {"kind": "status", "label": "session started", "detail": str(event.get("thread_id") or "")}
+    if kind in ("item.started", "item.completed"):
+        item = event.get("item") if isinstance(event.get("item"), dict) else {}
+        item_type = str(item.get("type") or "item")
+        phase = "started" if kind.endswith("started") else "done"
+        detail = ""
+        if item_type == "command_execution":
+            detail = str(item.get("command") or "")
+        elif item_type in ("web_search", "web_search_call"):
+            action = item.get("action") if isinstance(item.get("action"), dict) else {}
+            detail = str(action.get("query") or action.get("url") or "")
+        elif item_type in ("agent_message", "reasoning"):
+            detail = str(item.get("text") or item.get("summary") or "")[:600]
+        if item_type == "reasoning":
+            bucket = "reasoning"
+        elif item_type in ("command_execution", "web_search", "web_search_call", "mcp_tool_call", "file_change"):
+            bucket = "tool"
+        else:
+            bucket = "message"
+        return {"kind": bucket, "label": f"{item_type} {phase}", "detail": detail}
+    if kind == "turn.completed":
+        usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
+        tokens = usage.get("output_tokens")
+        detail = f"{tokens} output tokens" if tokens is not None else ""
+        return {"kind": "status", "label": "turn completed", "detail": detail}
+    if kind in ("error", "turn.failed"):
+        return {"kind": "error", "label": "error", "detail": json.dumps(event)[:600]}
+    return None
+
+
 class CodexAdapter(ProviderAdapter):
-    def invoke(self, prompt: str, *, model: str, native_session_id: str | None, initial: bool, system_prompt: str, cwd: str, effort: str = "", plan_mode: bool = True, cancel: threading.Event | None = None) -> InvocationResult:
+    def invoke(self, prompt: str, *, model: str, native_session_id: str | None, initial: bool, system_prompt: str, cwd: str, effort: str = "", plan_mode: bool = True, cancel: threading.Event | None = None, timeout: int | None = None, progress: ProgressCallback | None = None) -> InvocationResult:
         argv = [self.spec.executable, "exec", "--json", "--skip-git-repo-check", "--sandbox", "read-only"]
         if model:
             argv += ["--model", model]
@@ -794,7 +891,15 @@ class CodexAdapter(ProviderAdapter):
         else:
             argv += ["resume", native_session_id or ""]
             effective_prompt = prompt
-        output = self._run(argv, prompt=effective_prompt, cwd=cwd, cancel=cancel)
+
+        def on_line(line: str) -> None:
+            if progress is None:
+                return
+            event = _progress_event(line)
+            if event is not None:
+                progress(event)
+
+        output = self._run(argv, prompt=effective_prompt, cwd=cwd, cancel=cancel, timeout=timeout, on_line=on_line)
         events = list(_json_lines(output))
         return InvocationResult(
             _find_text(events) or output,
@@ -805,7 +910,7 @@ class CodexAdapter(ProviderAdapter):
 
 
 class OpenCodeAdapter(ProviderAdapter):
-    def invoke(self, prompt: str, *, model: str, native_session_id: str | None, initial: bool, system_prompt: str, cwd: str, effort: str = "", plan_mode: bool = True, cancel: threading.Event | None = None) -> InvocationResult:
+    def invoke(self, prompt: str, *, model: str, native_session_id: str | None, initial: bool, system_prompt: str, cwd: str, effort: str = "", plan_mode: bool = True, cancel: threading.Event | None = None, timeout: int | None = None, progress: ProgressCallback | None = None) -> InvocationResult:
         argv = [self.spec.executable, "run", "--format", "json", "--dir", cwd]
         if model:
             argv += ["--model", model]
@@ -815,7 +920,15 @@ class OpenCodeAdapter(ProviderAdapter):
         else:
             argv += ["--session", native_session_id or ""]
             effective_prompt = prompt
-        output = self._run(argv, prompt=effective_prompt, cwd=cwd, cancel=cancel)
+
+        def on_line(line: str) -> None:
+            if progress is None:
+                return
+            event = _progress_event(line)
+            if event is not None:
+                progress(event)
+
+        output = self._run(argv, prompt=effective_prompt, cwd=cwd, cancel=cancel, timeout=timeout, on_line=on_line)
         events = list(_json_lines(output))
         return InvocationResult(
             _find_text(events) or output,

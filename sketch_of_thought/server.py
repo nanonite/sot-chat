@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from email.parser import BytesParser
 from email.policy import default as email_policy
 from http import HTTPStatus
@@ -23,6 +25,7 @@ from .chat import (
     PARADIGMS,
     Conversation,
     ConversationStore,
+    ProgressCallback,
     ProviderCancelled,
     ProviderError,
     Router,
@@ -59,6 +62,90 @@ def _flag(value: Any) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+PROVIDER_TIMEOUT_MIN = 30
+PROVIDER_TIMEOUT_MAX = 86_400
+TURN_EVENT_LIMIT = 400
+
+
+def _resolve_timeout(value: Any) -> int:
+    """Resolve the per-send harness timeout in seconds.
+
+    A blank value falls back to ``SOT_PROVIDER_TIMEOUT`` so the environment
+    default keeps working; an explicit value lets the UI tune one send without
+    restarting the server.
+    """
+
+    default = _limit("SOT_PROVIDER_TIMEOUT", 900)
+    if value is None or value == "":
+        return default
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("timeout must be an integer number of seconds") from exc
+    if not (PROVIDER_TIMEOUT_MIN <= seconds <= PROVIDER_TIMEOUT_MAX):
+        raise ValueError(
+            f"timeout must be between {PROVIDER_TIMEOUT_MIN} and {PROVIDER_TIMEOUT_MAX} seconds"
+        )
+    return seconds
+
+
+@dataclass
+class TurnStatus:
+    """Live state for one in-flight harness turn.
+
+    Turns run on a background thread so a slow harness never holds the HTTP
+    request open. The UI polls this state, which is what lets it show progress
+    and survive a server restart instead of surfacing a raw network error.
+    """
+
+    id: str
+    conversation_id: str
+    provider: str
+    model: str
+    effort: str
+    timeout: int
+    status: str = "running"
+    started_at: str = field(default_factory=utc_now)
+    finished_at: str | None = None
+    error: str | None = None
+    step_count: int = 0
+    last_event_at: str | None = None
+    events: list[dict[str, Any]] = field(default_factory=list)
+    _started_monotonic: float = field(default_factory=time.monotonic)
+
+    def add_event(self, event: dict[str, Any]) -> None:
+        entry = dict(event)
+        entry.setdefault("at", utc_now())
+        self.events.append(entry)
+        if len(self.events) > TURN_EVENT_LIMIT:
+            del self.events[: len(self.events) - TURN_EVENT_LIMIT]
+        self.step_count += 1
+        self.last_event_at = str(entry["at"])
+
+    def finish(self, status: str, *, error: str | None = None) -> None:
+        self.status = status
+        self.error = error
+        self.finished_at = utc_now()
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "conversation_id": self.conversation_id,
+            "provider": self.provider,
+            "model": self.model,
+            "effort": self.effort,
+            "timeout": self.timeout,
+            "status": self.status,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "elapsed_ms": int((time.monotonic() - self._started_monotonic) * 1000),
+            "step_count": self.step_count,
+            "last_event_at": self.last_event_at,
+            "events": self.events[-60:],
+            "error": self.error,
+        }
+
+
 class ConversationBusy(RuntimeError):
     """Raised when a turn is already running for one conversation."""
 
@@ -83,6 +170,7 @@ class ChatApplication:
         self._summary_running: set[str] = set()
         self._sending: set[str] = set()
         self._cancel_events: dict[str, threading.Event] = {}
+        self._turns: dict[str, TurnStatus] = {}
 
     def _register_cancel(self, conversation_id: str, event: threading.Event) -> None:
         with self._locks_lock:
@@ -144,6 +232,11 @@ class ChatApplication:
             "paradigms": list(PARADIGMS),
             "efforts": effort_options(),
             "efforts_by_provider": {spec.key: effort_options(spec.key) for spec in provider_specs()},
+            "provider_timeout": {
+                "default": _limit("SOT_PROVIDER_TIMEOUT", 900),
+                "min": PROVIDER_TIMEOUT_MIN,
+                "max": PROVIDER_TIMEOUT_MAX,
+            },
             "conversations": [self._summary(item) for item in self.store.list()],
         }
 
@@ -162,6 +255,9 @@ class ChatApplication:
             "context_upto": conversation.context_upto,
             "context_summary_chars": len(conversation.context_summary),
             "context_revision": conversation.context_revision,
+            # A transcript that ends on a user message means the reply never
+            # landed: the turn timed out or the server restarted mid-flight.
+            "interrupted": bool(conversation.messages) and conversation.messages[-1].get("role") == "user",
         }
 
     def create(self, payload: dict[str, Any]) -> Conversation:
@@ -272,12 +368,35 @@ class ChatApplication:
             return conversation
 
 
-    def send(self, conversation_id: str, payload: dict[str, Any]) -> Conversation:
+    def send(
+        self,
+        conversation_id: str,
+        payload: dict[str, Any],
+        *,
+        timeout: int | None = None,
+        progress: ProgressCallback | None = None,
+    ) -> Conversation:
+        """Run one turn synchronously (kept for direct callers and tests)."""
+
+        with self._sending_guard(conversation_id):
+            try:
+                return self._send_locked(conversation_id, payload, timeout=timeout, progress=progress)
+            except ProviderCancelled:
+                return self.store.load(conversation_id)
+
+    def _send_locked(
+        self,
+        conversation_id: str,
+        payload: dict[str, Any],
+        *,
+        timeout: int | None = None,
+        progress: ProgressCallback | None = None,
+    ) -> Conversation:
         text = str(payload.get("message") or "").strip()
         if not text:
             raise ValueError("message is required")
 
-        with self._sending_guard(conversation_id), self._lock_for(conversation_id):
+        with self._lock_for(conversation_id):
             conversation = self.store.load(conversation_id)
             provider = str(payload.get("provider") or conversation.provider)
             model = str(payload.get("model") if payload.get("model") is not None else conversation.model).strip()[:200]
@@ -353,14 +472,13 @@ class ChatApplication:
                     system_prompt=system_prompt,
                     cwd=os.environ.get("SOT_WORKDIR", os.getcwd()),
                     cancel=cancel_event,
+                    timeout=timeout,
+                    progress=progress,
                 )
             except ProviderCancelled:
                 # Keep the user message so a stopped turn can be retried.
                 conversation.updated_at = utc_now()
                 self.store.save(conversation)
-                return conversation
-            except ProviderError:
-                # Keep the user message so retrying does not silently lose it.
                 raise
             finally:
                 self._unregister_cancel(conversation_id, cancel_event)
@@ -389,6 +507,80 @@ class ChatApplication:
             self.store.save(conversation)
             self._schedule_compaction(conversation, provider, model)
             return conversation
+
+    def start_turn(self, conversation_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Start one turn on a background thread and return its live status.
+
+        The HTTP request returns immediately; the client polls ``turn_status``.
+        That keeps a 15-minute harness run from looking like a broken connection
+        and lets the transcript survive a server restart.
+        """
+
+        text = str(payload.get("message") or "").strip()
+        if not text:
+            raise ValueError("message is required")
+        timeout = _resolve_timeout(payload.get("timeout"))
+
+        with self._locks_lock:
+            if conversation_id in self._sending:
+                raise ConversationBusy("a reply is already running for this conversation")
+            self._sending.add(conversation_id)
+        try:
+            conversation = self.store.load(conversation_id)
+            turn = TurnStatus(
+                id=str(uuid.uuid4()),
+                conversation_id=conversation_id,
+                provider=str(payload.get("provider") or conversation.provider),
+                model=str(
+                    payload.get("model") if payload.get("model") is not None else conversation.model
+                ).strip()[:200],
+                effort=normalize_effort(payload.get("effort") if payload.get("effort") is not None else conversation.effort),
+                timeout=timeout,
+            )
+            with self._locks_lock:
+                self._turns[conversation_id] = turn
+        except Exception:
+            with self._locks_lock:
+                self._sending.discard(conversation_id)
+            raise
+
+        threading.Thread(
+            target=self._run_turn,
+            args=(conversation_id, payload, timeout, turn),
+            name=f"sot-turn-{conversation_id[:8]}",
+            daemon=True,
+        ).start()
+        return turn.snapshot()
+
+    def _run_turn(
+        self,
+        conversation_id: str,
+        payload: dict[str, Any],
+        timeout: int,
+        turn: TurnStatus,
+    ) -> None:
+        try:
+            self._send_locked(conversation_id, payload, timeout=timeout, progress=turn.add_event)
+            turn.finish("completed")
+        except ProviderCancelled:
+            turn.finish("cancelled")
+        except ProviderError as exc:
+            turn.finish("failed", error=str(exc))
+        except Exception as exc:  # defensive: never leave a turn marked running
+            turn.finish("failed", error=str(exc))
+        finally:
+            with self._locks_lock:
+                self._sending.discard(conversation_id)
+
+    def turn_status(self, conversation_id: str) -> dict[str, Any]:
+        conversation = self.store.load(conversation_id).as_dict()
+        with self._locks_lock:
+            turn = self._turns.get(conversation_id)
+        if turn is None:
+            return {"status": "idle", "conversation": conversation}
+        snapshot = turn.snapshot()
+        snapshot["conversation"] = conversation
+        return snapshot
 
     def _schedule_compaction(
         self,
@@ -473,17 +665,107 @@ INDEX_HTML = r'''<!doctype html>
 <style>
 :root{color-scheme:dark;--bg:#101216;--panel:#171a20;--line:#2b303b;--muted:#9ca5b5;--accent:#8ec5ff;--user:#1c3148;--assistant:#20252d}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:#edf1f7;font:14px system-ui,-apple-system,Segoe UI,sans-serif;height:100vh;display:grid;grid-template-columns:260px minmax(0,1fr);min-width:0;min-height:0;overflow-x:hidden}
-aside{border-right:1px solid var(--line);padding:16px;overflow:auto;background:#13161b}h1{font-size:16px;margin:0 0 14px}button,select,input,textarea{font:inherit;color:inherit;background:var(--panel);border:1px solid var(--line);border-radius:7px;padding:8px}button{cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}button:hover{border-color:var(--accent)}#new{width:100%;margin-bottom:14px}.conversation{display:block;width:100%;text-align:left;margin:5px 0;background:transparent;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.conversation.active{border-color:var(--accent);background:#1b2837}.small{font-size:12px;color:var(--muted)}main{display:grid;grid-template-rows:auto auto auto minmax(0,1fr) auto;min-width:0;min-height:0}.toolbar{padding:12px 18px;border-bottom:1px solid var(--line);display:flex;gap:8px;align-items:center;flex-wrap:wrap;min-width:0}.toolbar label{color:var(--muted);font-size:12px}.toolbar select{min-width:190px}.toolbar input{width:220px}.toolbar input.upload-input{width:235px;min-width:180px;padding:5px}.include-upload{display:flex;align-items:center;gap:4px;white-space:nowrap}.include-upload input{width:auto;padding:0}.plan-mode-group{display:none;align-items:center;gap:10px;font-size:12px;color:var(--muted);white-space:nowrap}.plan-mode-group.visible{display:flex}.plan-mode-group label{display:flex;align-items:center;gap:3px}.plan-mode-group input{width:auto;padding:0}.upload-status{font-size:12px;color:var(--muted);max-width:28ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.model-select{min-width:280px}.route{margin-left:auto;color:var(--accent);font-size:12px;border:1px solid var(--line);border-radius:999px;padding:5px 9px;background:#151c25;max-width:44ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.view-tabs{display:flex;gap:6px;padding:10px 18px 0}.view-tab{border-radius:999px;padding:5px 10px;color:var(--muted);background:transparent}.view-tab.active{color:#edf1f7;background:#25364a;border-color:#3975ad}.delete-session{width:100%;margin-top:5px;color:#f2a3a3}.chat{width:100%;min-width:0;min-height:0;overflow:auto;overscroll-behavior:contain;padding:24px max(18px,calc((100vw - 920px)/2));display:flex;flex-direction:column;align-items:stretch;gap:14px}.bubble{width:min(860px,100%);max-width:100%;min-width:0;border:1px solid var(--line);border-radius:10px;padding:12px 14px;white-space:pre-wrap;line-height:1.5;overflow:visible;overflow-wrap:anywhere;word-break:break-word}.bubble>div{max-width:100%;min-width:0;overflow:visible;overflow-wrap:anywhere;word-break:break-word}.bubble.user{align-self:flex-end;background:var(--user)}.bubble.assistant{align-self:flex-start;background:var(--assistant)}.meta{display:flex;align-items:center;gap:8px;font-size:11px;color:var(--muted);margin-bottom:6px}.copy-button{margin-left:auto;padding:2px 8px;font-size:11px;line-height:1.2;color:var(--muted);background:transparent}.composer{border-top:1px solid var(--line);padding:14px max(18px,calc((100vw - 920px)/2));display:flex;gap:8px}.composer textarea{resize:vertical;min-height:54px;flex:1}.composer button{align-self:flex-end;background:#254a70;border-color:#3975ad}.composer button.stop-button{align-self:flex-end;background:#4a2530;border-color:#8a3b4b}.composer button.stop-button:not(:disabled):hover{border-color:#d98a9a}.empty{color:var(--muted);margin:auto;text-align:center}.warning{color:#f2c879;font-size:12px;margin:0 18px 8px}@media(max-width:700px){body{grid-template-columns:1fr}aside{display:none}.route{width:100%;margin-left:0}.toolbar input{width:150px}}
+aside{border-right:1px solid var(--line);padding:16px;overflow:auto;background:#13161b}h1{font-size:16px;margin:0 0 14px}button,select,input,textarea{font:inherit;color:inherit;background:var(--panel);border:1px solid var(--line);border-radius:7px;padding:8px}button{cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}button:hover{border-color:var(--accent)}#new{width:100%;margin-bottom:14px}.conversation{display:block;width:100%;text-align:left;margin:5px 0;background:transparent;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.conversation.active{border-color:var(--accent);background:#1b2837}.small{font-size:12px;color:var(--muted)}main{display:grid;grid-template-rows:auto auto auto minmax(0,1fr) auto;min-width:0;min-height:0}.toolbar{padding:12px 18px;border-bottom:1px solid var(--line);display:flex;gap:8px;align-items:center;flex-wrap:wrap;min-width:0}.toolbar label{color:var(--muted);font-size:12px}.toolbar select{min-width:190px}.toolbar input{width:220px}.toolbar input.upload-input{width:235px;min-width:180px;padding:5px}.include-upload{display:flex;align-items:center;gap:4px;white-space:nowrap}.include-upload input{width:auto;padding:0}.plan-mode-group{display:none;align-items:center;gap:10px;font-size:12px;color:var(--muted);white-space:nowrap}.plan-mode-group.visible{display:flex}.plan-mode-group label{display:flex;align-items:center;gap:3px}.plan-mode-group input{width:auto;padding:0}.upload-status{font-size:12px;color:var(--muted);max-width:28ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.model-select{min-width:280px}.route{margin-left:auto;color:var(--accent);font-size:12px;border:1px solid var(--line);border-radius:999px;padding:5px 9px;background:#151c25;max-width:44ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.view-tabs{display:flex;gap:6px;padding:10px 18px 0}.view-tab{border-radius:999px;padding:5px 10px;color:var(--muted);background:transparent}.view-tab.active{color:#edf1f7;background:#25364a;border-color:#3975ad}.delete-session{width:100%;margin-top:5px;color:#f2a3a3}.chat{width:100%;min-width:0;min-height:0;overflow:auto;overscroll-behavior:contain;padding:24px max(18px,calc((100vw - 920px)/2));display:flex;flex-direction:column;align-items:stretch;gap:14px}.bubble{width:min(860px,100%);max-width:100%;min-width:0;border:1px solid var(--line);border-radius:10px;padding:12px 14px;white-space:pre-wrap;line-height:1.5;overflow:visible;overflow-wrap:anywhere;word-break:break-word}.bubble>div{max-width:100%;min-width:0;overflow:visible;overflow-wrap:anywhere;word-break:break-word}.bubble.user{align-self:flex-end;background:var(--user)}.bubble.assistant{align-self:flex-start;background:var(--assistant)}.meta{display:flex;align-items:center;gap:8px;font-size:11px;color:var(--muted);margin-bottom:6px}.copy-button{margin-left:auto;padding:2px 8px;font-size:11px;line-height:1.2;color:var(--muted);background:transparent}.composer{border-top:1px solid var(--line);padding:14px max(18px,calc((100vw - 920px)/2));display:flex;gap:8px}.composer textarea{resize:vertical;min-height:54px;flex:1}.composer button{align-self:flex-end;background:#254a70;border-color:#3975ad}.composer button.stop-button{align-self:flex-end;background:#4a2530;border-color:#8a3b4b}.composer button.stop-button:not(:disabled):hover{border-color:#d98a9a}.empty{color:var(--muted);margin:auto;text-align:center}.warning{color:#f2c879;font-size:12px;margin:0 18px 8px}.warning.error{color:#f2a3a3}.warning.live{color:var(--accent)}.toolbar input.timeout-input{width:88px;min-width:88px;padding:5px}@media(max-width:700px){body{grid-template-columns:1fr}aside{display:none}.route{width:100%;margin-left:0}.toolbar input{width:150px}}
 </style></head>
 <body><aside><h1>SoT planning chats</h1><button id="new">＋ New session</button><button id="delete" class="delete-session" disabled>Delete session</button><div id="sessions"></div><p class="small">The transcript is stored locally. Harness sessions stay native where supported; switching harnesses uses a bounded text handoff.</p></aside>
-<main><div class="toolbar"><label for="provider">Harness</label><select id="provider"></select><label for="model">Model</label><select id="model" class="model-select"></select><input id="custom-model" placeholder="Custom model ID (optional)"><label for="effort">Effort</label><select id="effort"></select><span class="plan-mode-group" id="plan-mode-group" title="Plan mode: read-only, no tools. Full access: tools enabled, permission prompts bypassed."><label><input type="radio" name="plan-mode" id="plan-mode-on" value="on"> Plan mode</label><label><input type="radio" name="plan-mode" id="plan-mode-off" value="off"> Full access</label></span><label for="upload-files">Context files</label><input id="upload-files" class="upload-input" type="file" multiple accept=".txt,.md,.csv,.json,.yaml,.yml,.xml,.html,.log,.py,.js,.ts,.rst,.tex,text/*"><label class="include-upload"><input id="include-uploads" type="checkbox"> Include uploaded texts in next prompt</label><button id="clear-uploads" type="button">Clear</button><span class="upload-status" id="upload-status">No uploaded texts</span><label for="paradigm">Router</label><select id="paradigm"><option value="auto">Auto</option><option value="conceptual_chaining">Conceptual chaining</option><option value="chunked_symbolism">Chunked symbolism</option><option value="expert_lexicons">Expert lexicons</option></select><span class="upload-status" id="memory-status" title="Conversation context carried into each reply">Memory: new</span><span class="route" id="route">No turn yet</span></div> <nav class="view-tabs" aria-label="Chat view"><button class="view-tab active" data-view="response">Response log</button><button class="view-tab" data-view="thinking">Thinking log</button></nav><div class="warning" id="warning"></div><section class="chat" id="chat"><div class="empty">Create a session and start planning.</div></section><form class="composer" id="composer"><textarea id="message" placeholder="Describe what you are planning..."></textarea><button type="button" id="stop" class="stop-button" disabled>Stop</button><button id="send">Send</button></form></main>
+<main><div class="toolbar"><label for="provider">Harness</label><select id="provider"></select><label for="model">Model</label><select id="model" class="model-select"></select><input id="custom-model" placeholder="Custom model ID (optional)"><label for="effort">Effort</label><select id="effort"></select><span class="plan-mode-group" id="plan-mode-group" title="Plan mode: read-only, no tools. Full access: tools enabled, permission prompts bypassed."><label><input type="radio" name="plan-mode" id="plan-mode-on" value="on"> Plan mode</label><label><input type="radio" name="plan-mode" id="plan-mode-off" value="off"> Full access</label></span><label for="upload-files">Context files</label><input id="upload-files" class="upload-input" type="file" multiple accept=".txt,.md,.csv,.json,.yaml,.yml,.xml,.html,.log,.py,.js,.ts,.rst,.tex,text/*"><label class="include-upload"><input id="include-uploads" type="checkbox"> Include uploaded texts in next prompt</label><button id="clear-uploads" type="button">Clear</button><span class="upload-status" id="upload-status">No uploaded texts</span><label for="timeout" title="Per-send harness timeout in seconds. Raise it for long agentic runs; if a turn times out, retry with a larger value.">Timeout (s)</label><input id="timeout" class="timeout-input" type="number" min="30" max="86400" step="30"><label for="paradigm">Router</label><select id="paradigm"><option value="auto">Auto</option><option value="conceptual_chaining">Conceptual chaining</option><option value="chunked_symbolism">Chunked symbolism</option><option value="expert_lexicons">Expert lexicons</option></select><span class="upload-status" id="memory-status" title="Conversation context carried into each reply">Memory: new</span><span class="route" id="route">No turn yet</span></div> <nav class="view-tabs" aria-label="Chat view"><button class="view-tab active" data-view="response">Response log</button><button class="view-tab" data-view="thinking">Thinking log</button></nav><div class="warning" id="warning"></div><section class="chat" id="chat"><div class="empty">Create a session and start planning.</div></section><form class="composer" id="composer"><textarea id="message" placeholder="Describe what you are planning..."></textarea><button type="button" id="stop" class="stop-button" disabled>Stop</button><button id="send">Send</button></form></main>
 <script>
-let state={boot:null,conversation:null,view:"response",sending:false};
+let state={boot:null,conversation:null,view:"response",sending:false,turn:null,pollTimer:null};
 const byId=id=>document.getElementById(id);
 async function api(path,options){let r=await fetch(path,Object.assign({headers:{"content-type":"application/json"}},options||{}));let d=await r.json();if(!r.ok)throw Error(d.error||"Request failed");return d;}
 function selectedModel(){let custom=byId("custom-model").value.trim();return custom||byId("model").value;}
 function selectedEffort(){return byId("effort").value;}
 function selectedPlanMode(){return !byId("plan-mode-off").checked;}
+function selectedTimeout(){let value=byId("timeout").value.trim();if(!value)return "";let seconds=Number(value);return Number.isFinite(seconds)&&seconds>0?Math.round(seconds):"";}
+function renderTimeout(){let info=(state.boot&&state.boot.provider_timeout)||{};let input=byId("timeout");input.min=info.min||30;input.max=info.max||86400;if(!input.value&&info.default)input.value=info.default;}
+function progressLine(turn){
+  turn=turn||state.turn;if(!turn)return "Running…";
+  let elapsed=Math.round((turn.elapsed_ms||0)/1000);
+  let events=turn.events||[];let last=events.length?events[events.length-1]:null;
+  let label=last?(last.label||last.kind||"working"):"waiting for the harness";
+  let detail=last&&last.detail?(" — "+String(last.detail).split(String.fromCharCode(10))[0].slice(0,160)):"";
+  return "Thinking… "+elapsed+"s elapsed, "+(turn.step_count||0)+" step"+((turn.step_count===1)?"":"s")+" — "+label+detail;
+}
+function renderTurn(){
+  let turn=state.turn;
+  if(!turn||!state.conversation||turn.conversation_id!==state.conversation.id){return;}
+  let since=turn.last_event_at?Math.max(0,Math.round((Date.now()-Date.parse(turn.last_event_at))/1000)):null;
+  let line=progressLine(turn)+(since!=null?(" (last activity "+since+"s ago)"):"");
+  showWarning(line,false,"live");
+}
+function showWarning(text,isError,extraClass){
+  let element=byId("warning");element.textContent=text||"";
+  element.classList.toggle("error",!!isError);
+  element.classList.toggle("live",extraClass==="live");
+}
+function networkHint(error){
+  let message=error&&error.message?error.message:"Request failed";
+  if(/networkerror|failed to fetch|load failed|network error/i.test(message)){
+    return "Network error: the server may have restarted or the connection dropped mid-turn. The transcript is saved — reopen the session to continue. For long agentic runs, raise the Timeout (s) field before sending again.";
+  }
+  return message;
+}
+function finishTurn(){
+  if(state.pollTimer){clearTimeout(state.pollTimer);state.pollTimer=null;}
+  state.turn=null;state.sending=false;
+  byId("send").disabled=false;byId("send").textContent="Send";
+  byId("stop").disabled=true;byId("stop").textContent="Stop";
+  renderUploads();
+}
+function syncSummary(conversationId,conversation){
+  if(!conversation)return;
+  let summary=state.boot.conversations.find(function(item){return item.id===conversationId;});
+  if(!summary)return;
+  let messages=conversation.messages||[];
+  summary.message_count=messages.length;summary.upload_count=(conversation.uploads||[]).length;
+  summary.updated_at=conversation.updated_at;summary.provider=conversation.provider;summary.model=conversation.model;
+  summary.effort=conversation.effort;summary.plan_mode=conversation.plan_mode;
+  summary.interrupted=!!(messages.length&&messages[messages.length-1].role==="user");
+}
+function applyTurnConversation(turn,conversationId){
+  if(!turn||!turn.conversation)return;
+  if(state.conversation&&state.conversation.id===conversationId){
+    state.conversation=turn.conversation;
+    renderChat();renderUploads();renderMemory();renderRouter();
+  }
+}
+async function resumeTurn(conversationId){
+  if(!conversationId)return;
+  try{
+    let turn=await api("/api/conversations/"+encodeURIComponent(conversationId)+"/turn");
+    if(turn.status==="running"){
+      state.turn=turn;state.sending=true;
+      byId("send").disabled=true;byId("stop").disabled=false;
+      renderTurn();pollTurn(conversationId);return;
+    }
+    if(turn.conversation){applyTurnConversation(turn,conversationId);}
+    let messages=(turn.conversation&&turn.conversation.messages)||[];
+    if(turn.status==="idle"&&messages.length&&messages[messages.length-1].role==="user"){
+      showWarning("The last turn never finished (interrupted or timed out). Raise the Timeout (s) field and send again to retry.",true);
+    }
+  }catch(error){/* offline bootstrap already warns */}
+}
+function pollTurn(conversationId){
+  if(state.pollTimer)clearTimeout(state.pollTimer);
+  state.pollTimer=setTimeout(function(){tickTurn(conversationId);},900);
+}
+async function tickTurn(conversationId){
+  try{
+    let turn=await api("/api/conversations/"+encodeURIComponent(conversationId)+"/turn");
+    applyTurnConversation(turn,conversationId);
+    state.turn=turn;
+    if(turn.status==="running"){renderTurn();pollTurn(conversationId);return;}
+    finishTurn();
+    syncSummary(conversationId,turn.conversation);
+    renderSessions();
+    if(turn.status==="failed")showWarning(networkHint({message:turn.error||"The harness turn failed."}),true);
+    else if(turn.status==="cancelled")showWarning("Stopped.",false);
+    else showWarning("",false);
+  }catch(error){
+    finishTurn();
+    showWarning(networkHint(error),true);
+  }
+}
 function planModeSupported(providerKey){let spec=(state.boot.providers||[]).find(function(p){return p.key===providerKey;});return !!(spec&&spec.supports_plan_mode);}
 function renderPlanMode(){
   let supported=planModeSupported(byId("provider").value);
@@ -619,16 +901,33 @@ function addBubble(container,message,content,metaText){
 }
 
 
-function renderChat(){renderRouter();renderMemory();let c=state.conversation;let container=byId("chat");if(!c||!c.messages.length){container.innerHTML="";let empty=document.createElement("div");empty.className="empty";empty.textContent="Start a planning session.";container.appendChild(empty);return;}container.innerHTML="";let foundThinking=false;if(state.view==="thinking"){c.messages.forEach(function(m){if(m.role!=="assistant")return;let parts=splitThinking(m.content,m.thinking,m.response);if(!parts.thinking)return;foundThinking=true;addBubble(container,m,parts.thinking,(m.provider||"assistant")+" | "+(m.paradigm||"")+" | thinking");});if(!foundThinking){let empty=document.createElement("div");empty.className="empty";empty.textContent="No thinking blocks were returned by the selected harness.";container.appendChild(empty);}}else{c.messages.forEach(function(m){if(m.role==="assistant"){let parts=splitThinking(m.content,m.thinking,m.response);addBubble(container,m,parts.response||"(thinking block only)",(m.provider||"assistant")+" | "+(m.paradigm||"")+" | response");}else{addBubble(container,m,m.content,"You | "+(m.paradigm||""));}});}container.scrollTop=container.scrollHeight;}
-async function openConversation(id){state.conversation=await api("/api/conversations/"+encodeURIComponent(id));byId("provider").value=state.conversation.provider;byId("include-uploads").checked=false;renderModels();renderEfforts();renderPlanMode();renderUploads();renderSessions();renderChat();}
+function renderChat(){renderRouter();renderMemory();let c=state.conversation;let container=byId("chat");if(!c||!c.messages.length){container.innerHTML="";let empty=document.createElement("div");empty.className="empty";empty.textContent="Start a planning session.";container.appendChild(empty);return;}container.innerHTML="";let foundThinking=false;if(state.view==="thinking"){c.messages.forEach(function(m){if(m.role!=="assistant")return;let parts=splitThinking(m.content,m.thinking,m.response);if(!parts.thinking)return;foundThinking=true;addBubble(container,m,parts.thinking,(m.provider||"assistant")+" | "+(m.paradigm||"")+" | thinking");});if(!foundThinking){let empty=document.createElement("div");empty.className="empty";empty.textContent="No thinking blocks were returned by the selected harness.";container.appendChild(empty);}}else{c.messages.forEach(function(m){if(m.role==="assistant"){let parts=splitThinking(m.content,m.thinking,m.response);addBubble(container,m,parts.response||"(thinking block only)",(m.provider||"assistant")+" | "+(m.paradigm||"")+" | response");}else{addBubble(container,m,m.content,"You | "+(m.paradigm||""));}});}if(state.turn&&state.turn.status==="running"&&state.conversation&&state.turn.conversation_id===state.conversation.id){let events=state.turn.events||[];let nl=String.fromCharCode(10);let thinkingText=events.filter(function(e){return e.kind==="reasoning";}).map(function(e){return e.detail||e.label;}).filter(Boolean).join(nl+nl);let toolText=events.filter(function(e){return e.kind==="tool";}).map(function(e){return "• "+(e.label||"tool")+(e.detail?(": "+String(e.detail).split(nl)[0].slice(0,200)):"");}).join(nl);let liveContent=state.view==="thinking"?(thinkingText||toolText||"Waiting for the harness to report reasoning…"):progressLine();addBubble(container,{role:"assistant"},liveContent,"live | "+(state.turn.provider||"harness")+" | running");}container.scrollTop=container.scrollHeight;}
+async function openConversation(id){state.conversation=await api("/api/conversations/"+encodeURIComponent(id));byId("provider").value=state.conversation.provider;byId("include-uploads").checked=false;renderModels();renderEfforts();renderPlanMode();renderUploads();renderSessions();renderChat();resumeTurn(id);}
 async function newConversation(){let title=window.prompt("Name this planning session","New planning session");if(title===null)return;title=title.trim()||"New planning session";let c=await api("/api/conversations",{method:"POST",body:JSON.stringify({title:title,provider:byId("provider").value,model:selectedModel(),effort:selectedEffort(),plan_mode:selectedPlanMode()})});state.boot.conversations.unshift({id:c.id,title:c.title,provider:c.provider,model:c.model,effort:c.effort,plan_mode:c.plan_mode,updated_at:c.updated_at,message_count:0,upload_count:0});state.conversation=c;byId("include-uploads").checked=false;renderModels();renderEfforts();renderPlanMode();renderUploads();renderSessions();renderChat();}
 async function deleteConversation(){if(!state.conversation||state.sending)return;let currentId=state.conversation.id;if(window.confirm("Delete session: "+state.conversation.title+"?")===false)return;let button=byId("delete");button.disabled=true;try{await api("/api/conversations/"+encodeURIComponent(currentId),{method:"DELETE"});state.boot.conversations=state.boot.conversations.filter(function(c){return c.id!==currentId;});state.conversation=null;if(state.boot.conversations.length)await openConversation(state.boot.conversations[0].id);else{renderSessions();renderUploads();renderChat();}}catch(e){byId("warning").textContent=e.message;updateDeleteButton();}}
-async function stop(){if(!state.sending||!state.conversation)return;let stopButton=byId("stop");if(stopButton.disabled)return;stopButton.disabled=true;stopButton.textContent="Stopping...";try{await api("/api/conversations/"+encodeURIComponent(state.conversation.id)+"/cancel",{method:"POST"});}catch(error){byId("warning").textContent=error.message;}}
-async function send(){let text=byId("message").value.trim();if(!text||!state.conversation||state.sending)return;let button=byId("send");let stopButton=byId("stop");let conversationId=state.conversation.id;let runningMessage="Running the selected harness...";state.sending=true;button.disabled=true;button.textContent="Routing...";stopButton.disabled=false;stopButton.textContent="Stop";byId("warning").textContent=runningMessage;try{let result=await api("/api/conversations/"+encodeURIComponent(conversationId)+"/messages",{method:"POST",body:JSON.stringify({message:text,provider:byId("provider").value,model:selectedModel(),effort:selectedEffort(),plan_mode:selectedPlanMode(),paradigm:byId("paradigm").value,include_uploads:byId("include-uploads").checked})});let stopped=!!(result.messages&&result.messages.length&&result.messages[result.messages.length-1].role!=="assistant");if(state.conversation&&state.conversation.id===conversationId){state.conversation=result;byId("include-uploads").checked=false;}byId("message").value="";let c=state.boot.conversations.find(function(x){return x.id===conversationId;});if(c){c.message_count=result.messages.length;c.upload_count=(result.uploads||[]).length;c.updated_at=result.updated_at;c.provider=result.provider;c.model=result.model;c.effort=result.effort;c.plan_mode=result.plan_mode;}if(state.conversation&&state.conversation.id===conversationId){renderModels();renderEfforts();renderPlanMode();renderSessions();renderChat();}if(stopped)byId("warning").textContent="Stopped.";}catch(e){byId("warning").textContent=e.message;}finally{state.sending=false;button.disabled=false;button.textContent="Send";stopButton.disabled=true;stopButton.textContent="Stop";renderUploads();if(byId("warning").textContent===runningMessage)byId("warning").textContent="";}}
-async function boot(){state.boot=await api("/api/bootstrap");renderProviders();renderSessions();if(state.boot.conversations.length)await openConversation(state.boot.conversations[0].id);else{renderUploads();renderChat();}}
+async function stop(){if(!state.turn||state.turn.status!=="running"||!state.conversation)return;let stopButton=byId("stop");if(stopButton.disabled)return;stopButton.disabled=true;stopButton.textContent="Stopping...";try{await api("/api/conversations/"+encodeURIComponent(state.conversation.id)+"/cancel",{method:"POST"});}catch(error){showWarning(networkHint(error),true);}}
+async function send(){
+  let text=byId("message").value.trim();
+  if(!text||!state.conversation||state.sending)return;
+  let conversationId=state.conversation.id;
+  state.sending=true;
+  byId("send").disabled=true;byId("send").textContent="Routing...";
+  byId("stop").disabled=false;byId("stop").textContent="Stop";
+  showWarning("Starting the selected harness…",false,"live");
+  try{
+    let payload={message:text,provider:byId("provider").value,model:selectedModel(),effort:selectedEffort(),plan_mode:selectedPlanMode(),paradigm:byId("paradigm").value,include_uploads:byId("include-uploads").checked,timeout:selectedTimeout()};
+    let turn=await api("/api/conversations/"+encodeURIComponent(conversationId)+"/messages",{method:"POST",body:JSON.stringify(payload)});
+    byId("message").value="";byId("include-uploads").checked=false;
+    state.turn=turn;applyTurnConversation(turn,conversationId);renderTurn();pollTurn(conversationId);
+  }catch(error){
+    finishTurn();
+    showWarning(networkHint(error),true);
+  }
+}
+async function boot(){state.boot=await api("/api/bootstrap");renderProviders();renderTimeout();renderSessions();if(state.boot.conversations.length)await openConversation(state.boot.conversations[0].id);else{renderUploads();renderChat();}}
 let settingsTimer=null;
 function saveSettings(){if(!state.conversation)return;clearTimeout(settingsTimer);settingsTimer=setTimeout(async function(){try{let result=await api("/api/conversations/"+encodeURIComponent(state.conversation.id),{method:"PATCH",body:JSON.stringify({provider:byId("provider").value,model:selectedModel(),effort:selectedEffort(),plan_mode:selectedPlanMode()})});state.conversation.model_by_provider=result.model_by_provider;let summary=state.boot.conversations.find(function(x){return x.id===result.id;});if(summary){summary.provider=result.provider;summary.model=result.model;summary.effort=result.effort;summary.plan_mode=result.plan_mode;}}catch(error){byId("warning").textContent=error.message;}},250);}
-byId("new").onclick=newConversation;byId("delete").onclick=deleteConversation;byId("stop").onclick=stop;byId("upload-files").onchange=uploadFiles;byId("clear-uploads").onclick=clearUploads;byId("provider").onchange=function(){if(state.conversation){let remembered=(state.conversation.model_by_provider||{})[byId("provider").value];state.conversation.model=remembered||"";byId("custom-model").value="";}renderModels();renderEfforts();renderPlanMode();saveSettings();};byId("model").onchange=function(){byId("custom-model").value="";renderEfforts();saveSettings();};byId("custom-model").oninput=function(){renderEfforts();saveSettings();};byId("effort").onchange=saveSettings;byId("plan-mode-on").onchange=saveSettings;byId("plan-mode-off").onchange=saveSettings;byId("composer").onsubmit=function(e){e.preventDefault();send();};document.querySelectorAll(".view-tab").forEach(function(tab){tab.onclick=function(){setView(tab.dataset.view);};});boot().catch(function(e){byId("warning").textContent=e.message;});
+byId("new").onclick=newConversation;byId("delete").onclick=deleteConversation;byId("stop").onclick=stop;byId("upload-files").onchange=uploadFiles;byId("clear-uploads").onclick=clearUploads;byId("provider").onchange=function(){if(state.conversation){let remembered=(state.conversation.model_by_provider||{})[byId("provider").value];state.conversation.model=remembered||"";byId("custom-model").value="";}renderModels();renderEfforts();renderPlanMode();saveSettings();};byId("model").onchange=function(){byId("custom-model").value="";renderEfforts();saveSettings();};byId("custom-model").oninput=function(){renderEfforts();saveSettings();};byId("effort").onchange=saveSettings;byId("plan-mode-on").onchange=saveSettings;byId("plan-mode-off").onchange=saveSettings;byId("composer").onsubmit=function(e){e.preventDefault();send();};document.querySelectorAll(".view-tab").forEach(function(tab){tab.onclick=function(){setView(tab.dataset.view);};});boot().catch(function(e){showWarning(networkHint(e),true);});
 </script></body></html>''';
 
 
@@ -699,6 +998,11 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, self.app.bootstrap())
                 return
             prefix = "/api/conversations/"
+            turn_suffix = "/turn"
+            if path.startswith(prefix) and path.endswith(turn_suffix):
+                conversation_id = path[len(prefix):-len(turn_suffix)]
+                self._json(HTTPStatus.OK, self.app.turn_status(conversation_id))
+                return
             if path.startswith(prefix):
                 conversation = self.app.store.load(path[len(prefix):])
                 self._json(HTTPStatus.OK, conversation.as_dict())
@@ -732,7 +1036,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             suffix = "/messages"
             if path.startswith(prefix) and path.endswith(suffix):
                 conversation_id = path[len(prefix):-len(suffix)]
-                self._json(HTTPStatus.OK, self.app.send(conversation_id, payload).as_dict())
+                self._json(HTTPStatus.ACCEPTED, self.app.start_turn(conversation_id, payload))
                 return
             self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
         except ConversationBusy as exc:
@@ -814,7 +1118,8 @@ def main() -> None:
             "  SOT_CONTEXT_TAIL_CHARS      Verbatim recent-turn window (default 8000)\n"
             "  SOT_CONTEXT_SUMMARY_CHARS   Max running-summary length (default 4000)\n"
             "  SOT_WORKDIR                 Working directory for harness calls\n"
-            "  SOT_PROVIDER_TIMEOUT        Harness timeout in seconds (default 900)\n"
+            "  SOT_PROVIDER_TIMEOUT        Harness timeout in seconds (default 900);\n"
+            "                              overridable per send with the UI Timeout (s) field\n"
             "  SOT_UPLOAD_MAX_FILES        Max uploaded files per conversation (default 50)\n"
             "  SOT_UPLOAD_MAX_FILE_BYTES   Max bytes per uploaded file (default 1000000)\n"
             "  SOT_UPLOAD_MAX_TOTAL_BYTES  Max uploaded bytes per conversation (default 6000000)\n"
